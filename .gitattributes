@@ -1,0 +1,7 @@
+* text=auto eol=lf
+
+# Preserve document fixtures and the checksum-pinned vocabulary.
+*.pdf binary
+*.doc binary
+*.docx binary
+*.tiktoken binary

@@ -1,0 +1,83 @@
+[project]
+name = "recruitment-backend"
+version = "0.1.0"
+description = "Tenant-isolated recruitment intake, matching and review"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "alembic==1.20.1",
+    "boto3==1.43.123",
+    "cryptography==50.0.2",
+    "email-validator==2.3.0",
+    "fastapi==0.162.0",
+    "google-auth==2.62.1",
+    "google-auth-oauthlib==1.5.0",
+    "httpx==0.28.1",
+    "msal==1.39.0",
+    "olefile==0.47",
+    "openai==3.42.1",
+    "pgvector==0.5.1",
+    "phonenumbers==9.0.42",
+    "psycopg[binary]==3.3.7",
+    "pwdlib[argon2]==0.3.1",
+    "pydantic==2.14.2",
+    "pydantic-settings==2.16.2",
+    "pymupdf==2.1",
+    "python-docx==1.2.0",
+    "python-multipart==0.0.33",
+    "sqlalchemy==2.0.55",
+    "tiktoken==0.14.0",
+    "tzdata==2026.6",
+    "uvicorn[standard]==0.54.0",
+]
+
+[project.scripts]
+recruitment-api = "recruitment.cli:api"
+recruitment-worker = "recruitment.cli:worker"
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/recruitment"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/", "alembic/", "scripts/", "tests/", "docs/", "docker/", "README.md",
+    "alembic.ini", "compose.phase2.yml", "pyproject.toml", "uv.lock",
+    ".python-version", ".env.example", ".gitignore", ".gitattributes",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+packages = ["recruitment"]
+mypy_path = "src"
+exclude = ["alembic", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["pgvector.*", "pymupdf.*", "boto3.*", "botocore.*", "olefile.*", "google.*", "google_auth_oauthlib.*", "msal.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = ["integration: requires the dedicated PostgreSQL test database"]
+filterwarnings = ["error", "ignore:.*builtin type.*:DeprecationWarning"]
+
+[dependency-groups]
+dev = [
+    "httpx==0.28.1",
+    "mypy==2.4.1",
+    "pytest==9.2.0",
+    "pytest-cov==7.1.0",
+    "ruff==0.17.3",
+    "types-requests==2.33.0.20261030",
+]

@@ -1,0 +1,45 @@
+# Credentials, database state and local intake files
+.env
+.env.*
+!.env.example
+.local/
+.local-notes/
+.secrets/
+.credentials/
+/downloads/
+/uploads/
+*.pem
+*.key
+*.p12
+*.pfx
+*.dump
+*.sql.gz
+
+# Python environments, caches and generated files
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+test-results/
+*.log
+build/
+dist/
+*.whl
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+docs/
