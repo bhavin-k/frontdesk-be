@@ -157,12 +157,18 @@ class GmailMailboxProvider:
             body = part.get("body", {})
             if part.get("filename"):
                 attachment_id = body.get("attachmentId") or f"inline:{path}"
+                headers = {h["name"].lower(): h["value"] for h in part.get("headers", [])}
+                disposition = (
+                    headers.get("content-disposition", "").split(";", 1)[0].strip().lower()
+                )
                 attachments.append(
                     RemoteAttachment(
                         str(attachment_id),
                         str(part["filename"]),
                         str(part.get("mimeType", "")),
                         int(body.get("size", 0)),
+                        inline=disposition == "inline"
+                        or (disposition != "attachment" and "content-id" in headers),
                     )
                 )
             elif (

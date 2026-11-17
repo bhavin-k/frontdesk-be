@@ -4,10 +4,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, SecretStr, model_validator
 
-from recruitment.core.config import ScoringStrategy
-from recruitment.domain.contracts import Criterion
-from recruitment.domain.full_text import DocumentEvidence
-from recruitment.domain.openings import JobDetails, OpeningStatus, PreparationStatus
+from recruitment.domain.contracts import MatchResult
+from recruitment.domain.openings import JobDetails, OpeningStatus
 
 
 class Schema(BaseModel):
@@ -59,11 +57,6 @@ class MeRead(UserRead):
     memberships: list[MembershipRead]
 
 
-class CriterionRead(Criterion):
-    id: UUID
-    source_evidence: list[dict[str, Any]] = Field(default_factory=list)
-
-
 class OpeningDocumentRead(Schema):
     id: UUID
     file_name: str
@@ -81,13 +74,7 @@ class OpeningRead(Schema):
     questions: list[str]
     revision: int
     source_revision: int
-    criteria_status: PreparationStatus
-    criteria_error: str | None
-    criteria_metadata: dict[str, Any]
     documents: list[OpeningDocumentRead]
-    criteria_version_id: UUID | None
-    shortlist_threshold: float
-    criteria: list[CriterionRead]
 
 
 class UploadRead(Schema):
@@ -124,49 +111,11 @@ class ApplicationRead(Schema):
     recruiter_decision: dict[str, Any] | None = None
 
 
-class EvidenceRead(Schema):
-    chunk_id: UUID
-    quote: str
-    chunk_char_start: int
-    chunk_char_end: int
-    source_spans: list[dict[str, int | None]]
-
-
-class GradeRead(Schema):
-    criterion_id: UUID
-    criterion: str
-    required: bool
-    strict: bool
-    weight: float
-    status: Literal["met", "partial", "missing", "unknown"]
-    confidence: float
-    reason: str
-    evidence: list[EvidenceRead | DocumentEvidence]
-
-
-class MatchRead(Schema):
-    application_id: UUID
+class LegacyMatchRead(Schema):
     match_run_id: UUID
-    criteria_version_id: UUID
     score: float | None
-    score_provisional: bool = False
-    confidence: float | None = None
-    opening_id: UUID | None = None
-    opening_title: str | None = None
-    shortlist_threshold: float
-    recommendation: Literal["recommended_shortlist", "recommended_rejection", "needs_review"]
     reason: str
-    model: str
-    provider: str
-    prompt_version: str
-    scoring_strategy: ScoringStrategy
-    embedding_model: str | None
-    embedding_dimensions: Literal[1536] | None
-    embedding_fingerprint: str | None
-    processing_config: dict[str, Any]
-    missing_required_criteria: list[UUID]
-    processed_at: datetime
-    criteria: list[GradeRead]
+    recommendation: Literal["recommended_shortlist", "recommended_rejection", "needs_review"]
 
 
 class RoleAssessmentRead(Schema):
@@ -176,7 +125,7 @@ class RoleAssessmentRead(Schema):
     opening_status: str
     criteria_version_id: UUID | None
     state: str
-    eligibility: dict[str, Any]
+    match_result: MatchResult | None
     recommendation: Literal["recommended_shortlist", "recommended_rejection", "needs_review"]
     reason: str
     confidence: float | None
@@ -201,12 +150,12 @@ class EvaluationRead(Schema):
 
 class AssessmentDetail(Schema):
     assessment: RoleAssessmentRead
-    result: MatchRead | None
+    result: MatchResult | LegacyMatchRead | None
 
 
 class MatchResponse(Schema):
     status: str
-    result: MatchRead | None
+    result: MatchResult | LegacyMatchRead | None
     evaluation: EvaluationRead | None = None
 
 

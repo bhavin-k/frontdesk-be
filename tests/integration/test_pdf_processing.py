@@ -7,11 +7,9 @@ from sqlalchemy import select
 from recruitment.adapters.db.models import (
     CVUpload,
     MatchRun,
-    ResumeChunk,
     ResumeExtraction,
     ResumeFile,
 )
-from recruitment.adapters.db.openings import OpeningDocument
 from recruitment.adapters.fakes import FakeOCR
 from recruitment.core.errors import ProviderError
 from tests.integration.test_mail_intake import connect, new_mail
@@ -45,17 +43,14 @@ def test_attached_pdf_keeps_original_and_matches_only_page_text(context, cv, mon
     with pymupdf.open(stream=scans[1], filetype="pdf") as clean:
         assert clean.embfile_count() == 0
     result = context.result(identifier)
-    assert result["score"] == 100 and result["criteria"][0]["evidence"]
+    assert result["score"] == 100 and result["matched"] == ["Python"]
     db = context.client.app.state.container.db
     with db.transaction(db.api, UUID(context.tenant), UUID(context.user_id)) as session:
         assert session.scalar(select(ResumeFile.content)) == content
         extraction = session.scalar(select(ResumeExtraction))
-        assert extraction.method == "pymupdf+pdf-pages-v1"
+        assert extraction.method == "fake-ocr+pdf-pages-v1"
         assert extraction.profile["email"] == "candidate@example.org"
-        assert all(
-            "HIDDEN_NON_CV_PAYLOAD" not in chunk.text
-            for chunk in session.scalars(select(ResumeChunk))
-        )
+        assert all("HIDDEN_NON_CV_PAYLOAD" not in page["text"] for page in extraction.pages)
     _, other_headers = identity(context.client)
     original = f"{context.base}/cv-uploads/{identifier}/file"
     assert context.client.get(original, headers=other_headers).status_code == 404
@@ -67,11 +62,11 @@ def test_ocr_receives_only_the_attachment_free_pdf(context, monkeypatch):
     ocr = FakeOCR()
     calls = []
 
-    def extract(value):
+    def extract(value, mime_type):
         with pymupdf.open(stream=value, filetype="pdf") as clean:
             assert clean.embfile_count() == 0
         calls.append(value)
-        return ocr.extract(value)
+        return ocr.extract(value, mime_type)
 
     monkeypatch.setattr(context.providers.ocr, "extract", extract)
     uploaded = context.upload(content)
@@ -128,24 +123,3 @@ def test_failed_sanitization_requires_review_without_creating_a_score(context, c
     db = context.client.app.state.container.db
     with db.transaction(db.api, UUID(context.tenant), UUID(context.user_id)) as session:
         assert session.scalar(select(MatchRun.id)) is None
-
-
-def test_supporting_job_pdf_uses_the_same_safe_processing_path(context):
-    content = pdf_with_attachment(pdf_bytes("Python development experience is required."))
-    response = context.client.post(
-        f"{context.base}/openings",
-        headers=context.headers,
-        data={"payload": '{"title":"Python role","job_description":"Python development"}'},
-        files=[("files", ("requirements.pdf", content, "application/pdf"))],
-    )
-    assert response.status_code == 201, response.text
-    context.drain()
-    row = context.client.get(
-        f"{context.base}/openings/{response.json()['id']}", headers=context.headers
-    ).json()
-    assert row["criteria_status"] == "ready" and row["criteria"]
-    db = context.client.app.state.container.db
-    with db.transaction(db.api, UUID(context.tenant), UUID(context.user_id)) as session:
-        document = session.scalar(select(OpeningDocument))
-        assert document.content == content
-        assert document.extraction_method == "pymupdf+pdf-pages-v1"

@@ -8,13 +8,10 @@ from sqlalchemy import func, select
 from recruitment.adapters.db.models import (
     Application,
     Candidate,
-    CriteriaVersion,
-    MatchRun,
 )
 from recruitment.adapters.db.openings import OpeningIntakePeriod
 from recruitment.adapters.db.phase2 import IdentityReview
 from recruitment.core.time import utcnow
-from recruitment.domain.openings import ExtractedRequirement, GeneratedRequirements
 from recruitment.ports.mailbox import CursorExpired, MessagePage
 from tests.integration.test_mail_intake import connect, fake, new_mail, sync
 from tests.integration.test_retention import expire
@@ -53,14 +50,9 @@ def action(context, row, value):
 
 def test_minimal_job_and_multiple_active_openings(context):
     row = create(context, ready=False)
-    assert row["status"] == "active" and row["criteria_status"] == "queued"
-    assert row["criteria"] == [] and row["documents"] == []
+    assert row["status"] == "active"
+    assert row["documents"] == []
     context.drain()
-    prepared = read(context, row)
-    assert prepared["criteria_status"] == "ready"
-    assert prepared["shortlist_threshold"] == 75
-    assert all(c["weight"] == 1 and c["source_evidence"] for c in prepared["criteria"])
-    assert prepared["criteria_metadata"]["model"] == "fake-job-criteria-v1"
     assert (
         len(
             context.client.get(
@@ -111,7 +103,7 @@ def test_details_questions_versions_and_stale_updates(context):
     edited = context.client.patch(path, headers=context.headers, json=payload)
     assert edited.status_code == 200
     assert edited.json()["questions"] == payload["questions"]
-    assert edited.json()["criteria_version_id"] == row["criteria_version_id"]
+    assert edited.json()["source_revision"] == row["source_revision"]
     assert context.client.patch(path, headers=context.headers, json=payload).status_code == 409
     updated = context.client.patch(
         path,
@@ -122,17 +114,17 @@ def test_details_questions_versions_and_stale_updates(context):
             "job_description": "PostgreSQL development",
         },
     )
-    assert updated.status_code == 200 and updated.json()["criteria_status"] == "queued"
+    assert updated.status_code == 200
     context.drain()
-    assert read(context, row)["criteria_version_id"] != row["criteria_version_id"]
+    assert read(context, row)["source_revision"] == row["source_revision"] + 1
     with context.worker().queue.db.transaction(
         context.worker().queue.db.worker, UUID(context.tenant)
     ) as session:
         assert (
             session.scalar(
                 select(func.count())
-                .select_from(CriteriaVersion)
-                .where(CriteriaVersion.opening_id == UUID(row["id"]))
+                .select_from(OpeningIntakePeriod)
+                .where(OpeningIntakePeriod.opening_id == UUID(row["id"]))
             )
             == 2
         )
@@ -257,68 +249,6 @@ def test_pause_boundary_survives_cursor_recovery_and_worker_restart(context, mon
     assert candidates["items"][0]["profile"]["email"] == "current@example.org"
 
 
-def test_preparation_failure_then_retry_releases_waiting_cvs(context, cv, monkeypatch):
-    row = create(context, ready=False)
-    scoped = replace(context, opening=row["id"])
-    upload = scoped.upload(cv).json()
-    adapter = context.providers.job_criteria
-    original = adapter.requirements
-    monkeypatch.setattr(
-        adapter,
-        "requirements",
-        lambda sources: GeneratedRequirements(
-            criteria=[
-                ExtractedRequirement(
-                    text="Python development",
-                    required=True,
-                    source_id="description",
-                    quote="Invented quote",
-                )
-            ]
-        ),
-    )
-    context.drain()
-    failed = read(context, row)
-    assert failed["criteria_status"] == "failed"
-    status = context.client.get(
-        f"{context.base}/cv-uploads/{upload['upload_id']}", headers=context.headers
-    ).json()
-    assert status["status"] == "needs_review" and status["application_id"] is None
-    monkeypatch.setattr(adapter, "requirements", original)
-    retry = context.client.post(
-        f"{context.base}/openings/{row['id']}/criteria/retry",
-        headers=context.headers,
-        json={"expected_revision": failed["revision"]},
-    )
-    assert retry.status_code == 202
-    context.drain()
-    assert scoped.result(upload["upload_id"])["score"] == 100
-
-
-def test_close_during_matching_cannot_publish_shortlist(context, cv, monkeypatch):
-    upload = context.upload(cv).json()["upload_id"]
-    row = context.client.get(
-        f"{context.base}/openings/{context.opening}", headers=context.headers
-    ).json()
-    original = context.providers.grader.grade
-
-    def close_during_call(*args):
-        action(context, row, "close")
-        return original(*args)
-
-    monkeypatch.setattr(context.providers.grader, "grade", close_during_call)
-    context.drain()
-    status = context.client.get(
-        f"{context.base}/cv-uploads/{upload}", headers=context.headers
-    ).json()
-    assert status["status"] == "needs_review" and status["review_reason"] == "OPENING_CLOSED"
-    with context.worker().queue.db.transaction(
-        context.worker().queue.db.worker, UUID(context.tenant)
-    ) as session:
-        assert session.scalar(select(func.count()).select_from(MatchRun)) == 0
-        assert session.scalar(select(Application.status)) != "rejected"
-
-
 def test_cross_role_duplicates_and_updates_preserve_current_candidate(context, cv):
     uploaded = context.upload(cv).json()["upload_id"]
     context.drain()
@@ -340,7 +270,7 @@ def test_cross_role_duplicates_and_updates_preserve_current_candidate(context, c
     ) as session:
         assert session.scalar(select(func.count()).select_from(Application)) == 1
         assert session.scalar(select(Candidate.profile))["name"] == "Example Candidate"
-    assert context.result(uploaded)["match_run_id"] == original["match_run_id"]
+    assert context.result(uploaded)["evaluation_id"] == original["evaluation_id"]
     resolved = context.client.post(
         f"{context.base}/identity-reviews/{cases[0]['id']}/resolve",
         headers={**context.headers, "Idempotency-Key": "keep-existing-opening"},
@@ -431,76 +361,3 @@ def test_optional_details_are_validated(context, details):
         json={"title": "Job", "job_description": "Python development", "details": details},
     )
     assert response.status_code == 422
-
-
-def test_stale_requirements_cannot_publish_after_job_edit(context, monkeypatch):
-    row = create(context, ready=False)
-    adapter = context.providers.job_criteria
-    original = adapter.requirements
-    edited = False
-
-    def change_source(sources):
-        nonlocal edited
-        result = original(sources)
-        if not edited:
-            edited = True
-            changed = context.client.patch(
-                f"{context.base}/openings/{row['id']}",
-                headers=context.headers,
-                json={
-                    "title": row["title"],
-                    "job_description": "PostgreSQL development",
-                    "expected_revision": row["revision"],
-                },
-            )
-            assert changed.status_code == 200
-        return result
-
-    monkeypatch.setattr(adapter, "requirements", change_source)
-    context.drain()
-    ready = read(context, row)
-    assert ready["criteria_status"] == "ready" and ready["source_revision"] == 2
-    assert all("PostgreSQL" in criterion["text"] for criterion in ready["criteria"])
-    with context.worker().queue.db.transaction(
-        context.worker().queue.db.worker, UUID(context.tenant)
-    ) as session:
-        assert (
-            session.scalar(
-                select(func.count())
-                .select_from(CriteriaVersion)
-                .where(CriteriaVersion.opening_id == UUID(row["id"]))
-            )
-            == 1
-        )
-
-
-def test_preparation_transient_failures_have_bounded_retries(context, cv, monkeypatch):
-    from datetime import timedelta
-
-    from recruitment.adapters.db.models import Job
-    from recruitment.core.errors import ProviderError
-
-    row = create(context, ready=False)
-    scoped = replace(context, opening=row["id"])
-    uploaded = scoped.upload(cv).json()["upload_id"]
-
-    def unavailable(sources):
-        raise ProviderError("AI_UNAVAILABLE", retryable=True)
-
-    monkeypatch.setattr(context.providers.job_criteria, "requirements", unavailable)
-    context.drain()
-    assert read(context, row)["criteria_status"] == "queued"
-    queue = context.worker().queue
-    with queue.db.transaction(queue.db.worker, UUID(context.tenant)) as session:
-        job = session.scalar(
-            select(Job).where(Job.aggregate_id == UUID(row["id"]), Job.kind == "opening.prepare")
-        )
-        assert job.state == "retry_wait"
-        job.attempts = context.settings.max_job_attempts - 1
-        job.available_at = utcnow() - timedelta(seconds=1)
-    context.drain()
-    assert read(context, row)["criteria_status"] == "failed"
-    status = context.client.get(
-        f"{context.base}/cv-uploads/{uploaded}", headers=context.headers
-    ).json()
-    assert status["status"] == "needs_review" and status["application_id"] is None

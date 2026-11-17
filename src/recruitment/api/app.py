@@ -90,12 +90,12 @@ def create_app(settings: Settings | None = None, providers: Providers | None = N
         db,
         AuthService(db, settings),
         tenancy,
-        RecruitmentService(tenancy, providers, PostgresFileStorage, settings),
+        RecruitmentService(tenancy, providers, PostgresFileStorage),
         MailboxService(tenancy, providers.mailboxes),
-        CandidateService(tenancy, settings),
+        CandidateService(tenancy),
         MailNotifications(db, providers.mailboxes),
         OverviewService(tenancy),
-        OpeningService(tenancy, providers, settings),
+        OpeningService(tenancy, providers),
     )
 
     @asynccontextmanager
@@ -109,7 +109,7 @@ def create_app(settings: Settings | None = None, providers: Providers | None = N
                 db.dispose()
 
     app = FastAPI(
-        title="Recruitment API",
+        title="Frontdesk API",
         version="0.1.0",
         lifespan=lifespan,
         description="CV intake from uploads and new email, evidence matching and recruiter review.",
@@ -169,7 +169,7 @@ def create_app(settings: Settings | None = None, providers: Providers | None = N
             with db.transaction(engine) as session:
                 session.execute(text("SELECT 1"))
         with db.transaction(db.api) as session:
-            session.execute(text("SELECT id FROM job_runs LIMIT 0"))
+            session.execute(text("SELECT match_result FROM role_assessments LIMIT 0"))
         return {"status": "ok"}
 
     errors: dict[int | str, dict[str, Any]] = {

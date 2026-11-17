@@ -49,9 +49,19 @@ class FakeDocumentConverter:
     version = "fake-converter-v1"
 
     def convert(self, content: bytes, mime_type: str) -> bytes:
-        import pymupdf
+        import io
 
-        # Blank PDF invokes the explicitly fake OCR adapter in local mode.
+        import pymupdf
+        from docx import Document
+
+        from recruitment.adapters.documents import DOCX
+
         with pymupdf.open() as document:  # type: ignore[no-untyped-call]
-            document.new_page()
+            page = document.new_page()
+            if mime_type == DOCX:
+                source = Document(io.BytesIO(content))
+                lines = [paragraph.text for paragraph in source.paragraphs]
+                for table in source.tables:
+                    lines.extend(" | ".join(cell.text for cell in row.cells) for row in table.rows)
+                page.insert_textbox(page.rect + (36, 36, -36, -36), "\n".join(lines), fontsize=10)
             return bytes(document.tobytes())

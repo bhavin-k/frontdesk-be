@@ -10,7 +10,8 @@ def test_rejection_requires_confirmation_and_sets_retention(context: Context, cv
     result = context.result(response.json()["upload_id"])
     path = f"{context.base}/applications/{result['application_id']}/review-decisions"
     payload = {
-        "match_run_id": result["match_run_id"],
+        "evaluation_id": result["evaluation_id"],
+        "expected_version": result["expected_version"],
         "decision": "reject",
         "confirm_rejection": False,
         "reason": "Recruiter reviewed the candidate evidence.",
@@ -47,10 +48,11 @@ def test_stale_or_forged_match_cannot_be_confirmed(context: Context, cv: bytes) 
         f"{context.base}/applications/{result['application_id']}/review-decisions",
         headers={**context.headers, "Idempotency-Key": str(uuid4())},
         json={
-            "match_run_id": str(uuid4()),
+            "evaluation_id": str(uuid4()),
+            "expected_version": result["expected_version"],
             "decision": "reject",
             "confirm_rejection": True,
             "reason": "Attempt with a stale result.",
         },
     )
-    assert decision.status_code == 409
+    assert decision.status_code == 404

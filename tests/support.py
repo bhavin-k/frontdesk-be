@@ -92,7 +92,19 @@ class Context:
             headers=self.headers,
         )
         assert response.status_code == 200
-        return response.json()["result"]
+        read = response.json()
+        app = self.client.get(
+            f"{self.base}/applications/{status['application_id']}", headers=self.headers
+        ).json()
+        evaluation = read["evaluation"]
+        return {
+            **(read["result"] or {}),
+            "application_id": app["id"],
+            "evaluation_id": evaluation["id"],
+            "expected_version": app["version"],
+            "recommendation": evaluation["recommendation"],
+            "processed_at": evaluation["processed_at"],
+        }
 
 
 def identity(client: TestClient) -> tuple[str, dict[str, str]]:

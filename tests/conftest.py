@@ -7,14 +7,13 @@ from typing import Any
 
 import psycopg
 import pytest
-from alembic.config import Config
 from fastapi.testclient import TestClient
 
-from alembic import command
 from recruitment.adapters.db.models import Base
 from recruitment.adapters.providers import Providers
 from recruitment.api.app import create_app
 from recruitment.core.config import Settings
+from scripts.migrate import upgrade_database
 from tests.support import Context, identity, pdf_bytes
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,8 +60,7 @@ def admin_url() -> str:
 
 @pytest.fixture(scope="session")
 def migrated(admin_url: str) -> None:
-    config = Config(str(ROOT / "alembic.ini"))
-    command.upgrade(config, "head")
+    upgrade_database()
 
 
 @pytest.fixture
@@ -78,7 +76,6 @@ def settings() -> Settings:
         _env_file=None,
         environment="test",
         provider_mode="fake",
-        scoring_strategy="rag",
         mailbox_provider_mode="fake",
         auto_delete_enabled=False,
     )
@@ -115,7 +112,6 @@ def context(client: TestClient, settings: Settings, providers: Providers) -> Con
     context = Context(
         client, tenant, user_id, headers, opening_response.json()["id"], settings, providers
     )
-    context.drain()
     return context
 
 

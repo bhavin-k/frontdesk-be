@@ -7,7 +7,7 @@ def test_workspace_lists_restore_records_with_pagination(context: Context, cv: b
     openings = context.client.get(f"{context.base}/openings", headers=context.headers)
     assert openings.status_code == 200
     assert openings.json()["items"][0]["id"] == context.opening
-    assert openings.json()["items"][0]["criteria"][0]["text"] == "Python development"
+    assert openings.json()["items"][0]["job_description"] == "Python development"
     uploads = context.client.get(f"{context.base}/cv-uploads?limit=1", headers=context.headers)
     assert uploads.status_code == 200
     assert uploads.json()["items"][0]["upload_id"] == upload["upload_id"]

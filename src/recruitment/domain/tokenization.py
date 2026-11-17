@@ -1,4 +1,4 @@
-"""Local tokenizer shared by RAG and full-text scoring."""
+"""Offline token estimates for the parser and matcher request budgets."""
 
 import json
 from functools import lru_cache

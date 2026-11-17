@@ -59,7 +59,7 @@ def test_imap_uses_shared_pipeline_and_deduplicates_direct_upload(context, cv):
     assert len(intake) == 1 and intake[0]["upload_id"] == upload["upload_id"]
     assert provider.downloads == [("new", "file")]
     result = context.result(upload["upload_id"])
-    assert result["criteria"][0]["evidence"]
+    assert result["matched"]
     context.client.post(f"{context.base}/mailboxes/{mailbox['id']}/sync", headers=context.headers)
     context.drain()
     assert len(provider.downloads) == 1
@@ -111,7 +111,7 @@ def test_disabling_imap_blocks_api_scheduled_and_queued_work_preserves_candidate
         )
     context.drain()
     assert not provider.downloads
-    assert context.result(upload["upload_id"])["criteria"][0]["evidence"]
+    assert context.result(upload["upload_id"])["matched"]
     assert (
         context.client.post(
             f"{context.base}/mailboxes/imap",
@@ -310,4 +310,4 @@ def test_imap_worker_retries_transient_failure_without_rejecting_any_candidate(
         f"{context.base}/mailboxes/{mailbox['id']}", headers=context.headers
     ).json()
     assert row["sync_status"] == "idle" and row["last_success_at"]
-    assert context.result(upload["upload_id"])["criteria"][0]["evidence"]
+    assert context.result(upload["upload_id"])["matched"]

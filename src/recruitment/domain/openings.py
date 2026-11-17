@@ -1,18 +1,13 @@
-"""Job setup contracts and backend-owned matching policy."""
+"""Job setup and lifecycle contracts."""
 
-import re
 from datetime import UTC
 from typing import Literal
 
 from pydantic import AwareDatetime, Field, field_validator, model_validator
 
-from recruitment.core.errors import ProviderError
-from recruitment.domain.contracts import Criterion, StrictModel
-from recruitment.domain.matching import validate_criteria
+from recruitment.domain.contracts import StrictModel
 
 OpeningStatus = Literal["active", "paused", "closed"]
-PreparationStatus = Literal["queued", "processing", "ready", "failed"]
-SHORTLIST_THRESHOLD = 75
 
 
 class JobDetails(StrictModel):
@@ -76,41 +71,3 @@ class OpeningUpdate(OpeningCreate):
 class OpeningAction(StrictModel):
     action: Literal["pause", "continue", "close"]
     expected_revision: int = Field(ge=1)
-
-
-class RequirementSource(StrictModel):
-    id: str
-    text: str
-
-
-class ExtractedRequirement(StrictModel):
-    text: str = Field(min_length=3, max_length=500)
-    required: bool
-    strict: bool = False
-    source_id: str
-    quote: str = Field(min_length=1, max_length=2000)
-
-
-class GeneratedRequirements(StrictModel):
-    criteria: list[ExtractedRequirement] = Field(min_length=1, max_length=30)
-
-
-def checked_requirements(
-    result: GeneratedRequirements, sources: list[RequirementSource]
-) -> list[tuple[Criterion, dict[str, str]]]:
-    supplied = {source.id: source.text for source in sources}
-    checked = []
-    for item in result.criteria:
-        if (
-            item.source_id not in supplied
-            or not item.quote.strip()
-            or item.quote not in supplied[item.source_id]
-        ):
-            raise ProviderError("INVALID_JOB_EVIDENCE")
-        strict = item.strict and bool(
-            re.search(r"\b(must|mandatory|non-negotiable)\b", item.quote, re.I)
-        )
-        criterion = Criterion(text=item.text, required=item.required, strict=strict, weight=1)
-        validate_criteria([criterion])
-        checked.append((criterion, {"source_id": item.source_id, "quote": item.quote}))
-    return checked

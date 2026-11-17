@@ -9,7 +9,6 @@ from recruitment.core.errors import ProviderError
 from recruitment.ports.queue import Lease, LeaseLost, WorkerQueue
 from recruitment.services.deletion import RetentionService
 from recruitment.services.mail_intake import MailboxJobs
-from recruitment.services.opening_preparation import OpeningPreparation
 from recruitment.services.processing import CVProcessor
 
 logger = logging.getLogger(__name__)
@@ -19,7 +18,6 @@ class Worker:
     def __init__(self, queue: WorkerQueue, providers: Providers) -> None:
         self.queue = queue
         self.processor = CVProcessor(queue, providers)
-        self.openings = OpeningPreparation(queue, providers)
         self.retention = RetentionService(queue)
         providers.mailboxes = providers.mailboxes or MailboxRuntime(queue.settings)
         self.mailboxes = MailboxJobs(queue, providers, providers.mailboxes)
@@ -57,8 +55,6 @@ class Worker:
                     raise ProviderError("RETRY_EXHAUSTED")
                 if lease.kind == "cv.uploaded":
                     self.processor.process(lease)
-                elif lease.kind == "opening.prepare":
-                    self.openings.process(lease)
                 elif lease.kind == "retention.settings_changed":
                     self.retention.recalculate(lease)
                 elif lease.kind == "retention.application_due":

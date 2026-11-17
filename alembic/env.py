@@ -1,6 +1,6 @@
 import os
 
-from sqlalchemy import create_engine, pool
+from sqlalchemy import Connection, create_engine, pool
 
 from alembic import context
 from recruitment.adapters.db import (
@@ -17,9 +17,20 @@ if not url:
 if context.is_offline_mode():
     raise RuntimeError("Use an online migration to validate roles and PostgreSQL extensions.")
 
-engine = create_engine(url, poolclass=pool.NullPool, hide_parameters=True)
-with engine.connect() as connection:
+
+def migrate(connection: Connection) -> None:
     context.configure(connection=connection, target_metadata=Base.metadata, compare_type=True)
     with context.begin_transaction():
         context.run_migrations()
-engine.dispose()
+
+
+connection = context.config.attributes.get("connection")
+if connection is not None:
+    migrate(connection)
+else:
+    engine = create_engine(url, poolclass=pool.NullPool, hide_parameters=True)
+    try:
+        with engine.connect() as connection:
+            migrate(connection)
+    finally:
+        engine.dispose()

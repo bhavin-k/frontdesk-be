@@ -34,6 +34,7 @@ class RemoteAttachment:
     filename: str
     mime_type: str
     size: int
+    inline: bool = False
 
 
 @dataclass(frozen=True)

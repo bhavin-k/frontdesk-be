@@ -7,7 +7,6 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from recruitment.adapters.db.models import IdempotencyRecord, Outbox
-from recruitment.core.config import ScoringStrategy
 from recruitment.core.errors import AppError
 
 
@@ -63,15 +62,12 @@ def emit(
     kind: str,
     aggregate_id: UUID,
     dedupe_key: str | None = None,
-    *,
-    scoring_strategy: ScoringStrategy = "rag",
 ) -> None:
     session.add(
         Outbox(
             id=uuid4(),
             tenant_id=tenant_id,
             kind=kind,
-            scoring_strategy=scoring_strategy,
             aggregate_id=aggregate_id,
             dedupe_key=dedupe_key or f"{kind}:{aggregate_id}:{uuid4()}",
         )

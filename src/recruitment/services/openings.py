@@ -6,24 +6,23 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import or_, select
+from sqlalchemy import ColumnElement, or_, select
 from sqlalchemy.orm import Session
 
-from recruitment.adapters.db.models import CriteriaVersion, CVUpload, JobCriterion, Opening, Outbox
+from recruitment.adapters.db.models import Opening
 from recruitment.adapters.db.openings import OpeningDocument, OpeningIntakePeriod
-from recruitment.adapters.documents import validate_file
+from recruitment.adapters.documents import DOCUMENT_TYPES, validate_file
 from recruitment.adapters.providers import Providers
-from recruitment.core.config import ScoringStrategy, Settings
 from recruitment.core.errors import AppError, ProviderError
 from recruitment.core.time import utcnow
+from recruitment.domain.contracts import JobDescription
 from recruitment.domain.openings import (
-    SHORTLIST_THRESHOLD,
     OpeningAction,
     OpeningCreate,
     OpeningUpdate,
 )
 from recruitment.services.auth import Principal
-from recruitment.services.common import emit, existing_request, missing, remember_request
+from recruitment.services.common import advisory_lock, existing_request, missing, remember_request
 from recruitment.services.tenancy import TenancyService
 
 MAX_DOCUMENTS = 5
@@ -40,47 +39,69 @@ class JobFile:
         return hashlib.sha256(self.content).hexdigest()
 
 
+def open_at(received_at: datetime) -> ColumnElement[bool]:
+    return (OpeningIntakePeriod.starts_at <= received_at) & or_(
+        OpeningIntakePeriod.ends_at.is_(None), OpeningIntakePeriod.ends_at > received_at
+    )
+
+
+def openings_at(session: Session, received_at: datetime) -> list[dict[str, Any]]:
+    return [
+        {"opening_id": str(period.opening_id), "jd": period.match_description}
+        for period in session.scalars(
+            select(OpeningIntakePeriod)
+            .where(open_at(received_at))
+            .order_by(OpeningIntakePeriod.opening_id)
+        )
+    ]
+
+
 def intake_allowed(session: Session, opening: Opening, received_at: datetime | None) -> bool:
-    if opening.status == "closed":
-        return False
     if received_at is None:
         return opening.status == "active"
     return (
         session.scalar(
             select(OpeningIntakePeriod.id)
-            .where(
-                OpeningIntakePeriod.opening_id == opening.id,
-                OpeningIntakePeriod.starts_at <= received_at,
-                or_(
-                    OpeningIntakePeriod.ends_at.is_(None), OpeningIntakePeriod.ends_at > received_at
-                ),
-            )
+            .where(OpeningIntakePeriod.opening_id == opening.id, open_at(received_at))
             .limit(1)
         )
         is not None
     )
 
 
-def release_waiting(session: Session, opening: Opening, strategy: ScoringStrategy) -> None:
-    uploads = session.scalars(
-        select(CVUpload).where(
-            CVUpload.opening_id == opening.id,
-            CVUpload.status == "queued",
-            CVUpload.retention_expires_at > utcnow(),
+def start_period(session: Session, opening: Opening, starts_at: datetime) -> None:
+    jd = JobDescription(
+        title=opening.title,
+        description=opening.job_description,
+        requirements=opening.details.get("candidate_requirements") or "",
+        min_experience_years=opening.details.get("total_experience_years") or 0,
+        relevant_experience_years=opening.details.get("relevant_experience_years"),
+        domain_experience=opening.details.get("domain_experience") or "",
+    )
+    session.add(
+        OpeningIntakePeriod(
+            tenant_id=opening.tenant_id,
+            opening_id=opening.id,
+            starts_at=starts_at,
+            match_description=jd.model_dump(),
         )
     )
-    for upload in uploads:
-        key = f"cv.uploaded:{upload.id}"
-        if not session.scalar(select(Outbox.id).where(Outbox.dedupe_key == key)):
-            emit(
-                session, opening.tenant_id, "cv.uploaded", upload.id, key, scoring_strategy=strategy
-            )
+
+
+def end_period(session: Session, opening: Opening, ends_at: datetime) -> None:
+    period = session.scalar(
+        select(OpeningIntakePeriod)
+        .where(OpeningIntakePeriod.opening_id == opening.id, OpeningIntakePeriod.ends_at.is_(None))
+        .with_for_update()
+    )
+    if period is not None:
+        period.ends_at = ends_at
+        session.flush()
 
 
 class OpeningService:
-    def __init__(self, tenants: TenancyService, providers: Providers, settings: Settings) -> None:
+    def __init__(self, tenants: TenancyService, providers: Providers) -> None:
         self.tenants, self.providers = tenants, providers
-        self.settings = settings
 
     @staticmethod
     def locked(session: Session, opening_id: UUID, expected: int | None = None) -> Opening:
@@ -108,22 +129,6 @@ class OpeningService:
         row = session.get(Opening, opening_id)
         if not row:
             raise missing()
-        version = session.scalar(
-            select(CriteriaVersion)
-            .where(CriteriaVersion.opening_id == row.id)
-            .order_by(CriteriaVersion.version.desc())
-        )
-        criteria = (
-            list(
-                session.scalars(
-                    select(JobCriterion)
-                    .where(JobCriterion.version_id == version.id)
-                    .order_by(JobCriterion.position)
-                )
-            )
-            if version
-            else []
-        )
         documents = session.scalars(
             select(OpeningDocument)
             .where(OpeningDocument.opening_id == row.id)
@@ -138,23 +143,7 @@ class OpeningService:
             "questions": row.questions,
             "revision": row.revision,
             "source_revision": row.source_revision,
-            "criteria_status": row.criteria_status,
-            "criteria_error": row.criteria_error,
-            "criteria_version_id": version.id if version else None,
-            "shortlist_threshold": version.shortlist_threshold if version else SHORTLIST_THRESHOLD,
-            "criteria_metadata": version.processing_metadata if version else {},
             "documents": [OpeningService.document_read(item) for item in documents],
-            "criteria": [
-                {
-                    "id": c.id,
-                    "text": c.text,
-                    "required": c.required,
-                    "strict": c.strict,
-                    "weight": c.weight,
-                    "source_evidence": c.source_evidence,
-                }
-                for c in criteria
-            ],
         }
 
     def read(self, actor: Principal, tenant: UUID, opening: UUID) -> dict[str, Any]:
@@ -183,6 +172,8 @@ class OpeningService:
         if len(files) > MAX_DOCUMENTS:
             raise AppError("DOCUMENT_LIMIT", "An opening supports up to five documents.")
         for file in files:
+            if file.mime_type not in DOCUMENT_TYPES:
+                raise AppError("UNSUPPORTED_FILE", "Upload a PDF, DOCX or DOC file.", 415)
             validate_file(file.content, file.mime_type)
             try:
                 self.providers.scanner.scan(file.content)
@@ -216,18 +207,6 @@ class OpeningService:
             )
         return bool(fresh)
 
-    @staticmethod
-    def prepare(session: Session, row: Opening) -> None:
-        row.criteria_status, row.criteria_error = "queued", None
-        row.preparation_config = {}
-        emit(
-            session,
-            row.tenant_id,
-            "opening.prepare",
-            row.id,
-            f"opening.prepare:{row.id}:{row.source_revision}:{row.revision}",
-        )
-
     def create(
         self,
         actor: Principal,
@@ -242,6 +221,7 @@ class OpeningService:
             "files": [{"hash": f.digest, "mime": f.mime_type, "name": f.name} for f in files],
         }
         with self.tenants.scope(actor, tenant) as session:
+            advisory_lock(session, f"tenant:{tenant}")
             previous = existing_request(session, tenant, "opening", key, fingerprint)
             if previous:
                 return self.read_session(session, previous), False
@@ -258,11 +238,8 @@ class OpeningService:
             )
             session.add(row)
             session.flush()
-            session.add(
-                OpeningIntakePeriod(tenant_id=tenant, opening_id=row.id, starts_at=utcnow())
-            )
+            start_period(session, row, utcnow())
             self.add_files(session, row, files)
-            self.prepare(session, row)
             remember_request(session, tenant, "opening", key, fingerprint, row.id)
             session.flush()
             return self.read_session(session, row.id), True
@@ -271,21 +248,21 @@ class OpeningService:
         self, actor: Principal, tenant: UUID, opening: UUID, payload: OpeningUpdate
     ) -> dict[str, Any]:
         with self.tenants.scope(actor, tenant) as session:
+            advisory_lock(session, f"tenant:{tenant}")
             row = self.locked(session, opening, payload.expected_revision)
             if row.status == "closed":
                 raise AppError("OPENING_CLOSED", "Closed openings cannot be edited.", 409)
             details = payload.details.model_dump(mode="json")
-            operational = {
-                "employment_type",
-                "salary_min",
-                "salary_max",
-                "headcount",
-                "application_deadline",
-            }
+            matching_fields = (
+                "candidate_requirements",
+                "total_experience_years",
+                "relevant_experience_years",
+                "domain_experience",
+            )
             changed = (
                 row.title != payload.title
                 or row.job_description != payload.job_description
-                or any(row.details.get(k) != v for k, v in details.items() if k not in operational)
+                or any(row.details.get(key) != details.get(key) for key in matching_fields)
             )
             row.title, row.job_description, row.details, row.questions = (
                 payload.title,
@@ -296,14 +273,19 @@ class OpeningService:
             row.revision += 1
             if changed:
                 row.source_revision += 1
-                self.prepare(session, row)
             session.flush()
+            if changed and row.status == "active":
+                now = utcnow()
+                end_period(session, row, now)
+                start_period(session, row, now)
+                session.flush()
             return self.read_session(session, row.id)
 
     def action(
         self, actor: Principal, tenant: UUID, opening: UUID, payload: OpeningAction
     ) -> dict[str, Any]:
         with self.tenants.scope(actor, tenant) as session:
+            advisory_lock(session, f"tenant:{tenant}")
             row = self.locked(session, opening, payload.expected_revision)
             targets = {"pause": ("active", "paused"), "continue": ("paused", "active")}
             if payload.action == "close":
@@ -319,38 +301,12 @@ class OpeningService:
                         409,
                     )
             now = utcnow()
-            current = session.scalar(
-                select(OpeningIntakePeriod)
-                .where(
-                    OpeningIntakePeriod.opening_id == row.id, OpeningIntakePeriod.ends_at.is_(None)
-                )
-                .with_for_update()
-            )
-            if current:
-                current.ends_at = now
-                session.flush()
+            if row.status == "active":
+                end_period(session, row, now)
             row.status, row.revision = target, row.revision + 1
             if target == "active":
-                session.add(OpeningIntakePeriod(tenant_id=tenant, opening_id=row.id, starts_at=now))
-            if target == "closed":
-                if row.criteria_status != "ready":
-                    row.criteria_status, row.criteria_error = "failed", "OPENING_CLOSED"
-                emit(
-                    session,
-                    tenant,
-                    "opening.prepare",
-                    row.id,
-                    f"opening.closed:{row.id}:{row.revision}",
-                )
+                start_period(session, row, now)
             session.flush()
-            from recruitment.services.matching import requeue_pending
-
-            requeue_pending(
-                session,
-                tenant,
-                f"lifecycle:{row.id}:{row.revision}",
-                self.settings.scoring_strategy,
-            )
             return self.read_session(session, row.id)
 
     def documents(
@@ -364,8 +320,7 @@ class OpeningService:
             if row.status == "closed":
                 raise AppError("OPENING_CLOSED", "Closed openings cannot be edited.", 409)
             if self.add_files(session, row, files):
-                row.revision, row.source_revision = row.revision + 1, row.source_revision + 1
-                self.prepare(session, row)
+                row.revision += 1
             session.flush()
             return self.read_session(session, row.id)
 
@@ -380,8 +335,7 @@ class OpeningService:
             if row.status == "closed":
                 raise AppError("OPENING_CLOSED", "Closed openings cannot be edited.", 409)
             session.delete(item)
-            row.revision, row.source_revision = row.revision + 1, row.source_revision + 1
-            self.prepare(session, row)
+            row.revision += 1
             session.flush()
             return self.read_session(session, row.id)
 
@@ -395,15 +349,3 @@ class OpeningService:
                 raise missing()
             session.expunge(item)
             return item
-
-    def retry(self, actor: Principal, tenant: UUID, opening: UUID, expected: int) -> dict[str, Any]:
-        with self.tenants.scope(actor, tenant) as session:
-            row = self.locked(session, opening, expected)
-            if row.status == "closed" or row.criteria_status != "failed":
-                raise AppError(
-                    "INVALID_OPENING_TRANSITION", "Only failed requirements can be retried.", 409
-                )
-            row.revision += 1
-            self.prepare(session, row)
-            session.flush()
-            return self.read_session(session, row.id)

@@ -18,7 +18,6 @@ from recruitment.adapters.db.models import (
 from recruitment.adapters.db.phase2 import IdentityReview
 from recruitment.adapters.documents import validate_file
 from recruitment.adapters.providers import Providers
-from recruitment.core.config import Settings
 from recruitment.core.errors import AppError, ProviderError
 from recruitment.core.time import ist_display, utcnow
 from recruitment.domain.retention import deadline
@@ -43,11 +42,9 @@ class RecruitmentService:
         tenants: TenancyService,
         providers: Providers,
         storage_factory: Callable[[Session, UUID], FileStorage],
-        settings: Settings,
     ) -> None:
         self.tenants, self.providers = tenants, providers
         self.storage_factory = storage_factory
-        self.settings = settings
 
     @staticmethod
     def _opening(session: Session, opening_id: UUID) -> dict[str, Any]:
@@ -84,6 +81,7 @@ class RecruitmentService:
         mime_type: str,
         key: str,
     ) -> tuple[dict[str, Any], bool]:
+        received_at = utcnow()
         validate_file(content, mime_type)
         # Authorize before calling even a local scanner.
         with self.tenants.scope(principal, tenant_id) as session:
@@ -110,8 +108,8 @@ class RecruitmentService:
                 opening_id,
                 content,
                 mime_type,
+                source_received_at=received_at,
                 storage_factory=self.storage_factory,
-                scoring_strategy=self.settings.scoring_strategy,
             )
             remember_request(session, tenant_id, "upload", key, payload, record.id)
             return self._upload(session, record.id), created
@@ -275,7 +273,6 @@ class RecruitmentService:
             ):
                 raise AppError("STALE_DECISION", "Refresh the current result before deciding.", 409)
             from recruitment.adapters.db.matching import MatchingEvaluation, RoleAssessment
-            from recruitment.services.matching import active_roles
 
             evaluation = (
                 session.get(MatchingEvaluation, app.latest_evaluation_id)
@@ -290,15 +287,14 @@ class RecruitmentService:
                         RoleAssessment.match_run_id == match_id,
                     )
                 )
-                if (
-                    evaluation.state != "completed"
-                    or not assessment
-                    or active_roles(session) != evaluation.role_snapshot
-                ):
+                if evaluation.state != "completed" or not assessment:
                     raise AppError(
                         "STALE_DECISION", "Refresh the current evaluation before deciding.", 409
                     )
                 if decision == "shortlist":
+                    opening = session.get(Opening, assessment.opening_id)
+                    if not opening or opening.status != "active":
+                        raise AppError("OPENING_NOT_ACTIVE", "Select an active opening.", 409)
                     app.opening_id = assessment.opening_id
             record = ReviewDecision(
                 id=uuid4(),

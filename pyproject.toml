@@ -5,7 +5,6 @@ description = "Tenant-isolated recruitment intake, matching and review"
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "alembic==1.20.1",
-    "boto3==1.43.123",
     "cryptography==50.0.2",
     "email-validator==2.3.0",
     "fastapi==0.162.0",
@@ -15,7 +14,7 @@ dependencies = [
     "msal==1.39.0",
     "olefile==0.47",
     "openai==3.42.1",
-    "pgvector==0.5.1",
+    "pillow==13.0.0",
     "phonenumbers==9.0.42",
     "psycopg[binary]==3.3.7",
     "pwdlib[argon2]==0.3.1",
@@ -28,6 +27,13 @@ dependencies = [
     "tiktoken==0.14.0",
     "tzdata==2026.6",
     "uvicorn[standard]==0.54.0",
+]
+
+[project.optional-dependencies]
+ocr = [
+    "numpy==2.3.5",
+    "paddleocr==3.7.0",
+    "paddlepaddle==3.3.1",
 ]
 
 [project.scripts]
@@ -63,7 +69,7 @@ mypy_path = "src"
 exclude = ["alembic", "tests"]
 
 [[tool.mypy.overrides]]
-module = ["pgvector.*", "pymupdf.*", "boto3.*", "botocore.*", "olefile.*", "google.*", "google_auth_oauthlib.*", "msal.*"]
+module = ["pymupdf.*", "paddleocr.*", "paddle.*", "olefile.*", "google.*", "google_auth_oauthlib.*", "msal.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

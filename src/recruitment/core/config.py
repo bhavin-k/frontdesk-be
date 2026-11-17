@@ -7,13 +7,8 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 OPENAI_BASE_URL = "https://api.openai.com/v1"
-DEFAULT_FULL_TEXT_REQUEST_TOKENS = 32_768
-DEFAULT_FULL_TEXT_OUTPUT_TOKENS = 3072
-DEFAULT_EXPERIENCE_REQUEST_TOKENS = 8_000
-DEFAULT_EXPERIENCE_OUTPUT_TOKENS = 3072
 LLMAPIFormat = Literal["responses", "chat_completions"]
 LLMOutputMode = Literal["json_schema", "json_object", "text"]
-ScoringStrategy = Literal["rag", "full_text"]
 
 
 class Settings(BaseSettings):
@@ -41,18 +36,10 @@ class Settings(BaseSettings):
     worker_database_url: SecretStr
     dispatcher_database_url: SecretStr
     provider_mode: Literal["real", "fake"] = "real"
-    scoring_strategy: ScoringStrategy = "full_text"
     cv_token_ceiling: int = Field(default=20_000, ge=1, le=200_000)
-    experience_request_tokens: int = Field(
-        default=DEFAULT_EXPERIENCE_REQUEST_TOKENS, ge=1024, le=1_000_000
-    )
-    experience_output_tokens: int = Field(
-        default=DEFAULT_EXPERIENCE_OUTPUT_TOKENS, ge=128, le=65_536
-    )
-    full_text_request_tokens: int = Field(
-        default=DEFAULT_FULL_TEXT_REQUEST_TOKENS, ge=1024, le=1_000_000
-    )
-    full_text_output_tokens: int = Field(default=DEFAULT_FULL_TEXT_OUTPUT_TOKENS, ge=128, le=65_536)
+    llm_request_tokens: int = Field(default=32_768, ge=1024, le=1_000_000)
+    llm_output_tokens: int = Field(default=3072, ge=128, le=65_536)
+    ocr_models_dir: str = ".local/paddleocr"
     llm_provider: str = Field(default="openai", min_length=1, max_length=200, pattern=r"\S")
     llm_base_url: str = OPENAI_BASE_URL
     llm_api_key: SecretStr | None = None
@@ -63,27 +50,6 @@ class Settings(BaseSettings):
     openai_api_key: SecretStr | None = None
     profile_model: str = Field(default="gpt-6-luna", min_length=1, max_length=200, pattern=r"\S")
     grader_model: str = Field(default="gpt-6.1-terra", min_length=1, max_length=200, pattern=r"\S")
-    embedding_model: str = Field(
-        default="text-embedding-3-large", min_length=1, max_length=200, pattern=r"\S"
-    )
-    embedding_dimensions: Literal[1536] = 1536
-    embedding_provider: str = Field(default="openai", min_length=1, max_length=200, pattern=r"\S")
-    embedding_base_url: str = OPENAI_BASE_URL
-    embedding_api_key: SecretStr | None = None
-    embedding_send_dimensions: bool = True
-    embedding_revision: str = Field(default="1", min_length=1, max_length=200, pattern=r"\S")
-    embedding_batch_size: int = Field(default=128, ge=1, le=128)
-    embedding_max_batch_tokens: int = Field(default=64000, ge=500, le=64000)
-    embedding_timeout_seconds: float = Field(default=30, gt=0, le=120)
-    embedding_max_parallel_calls: int = Field(default=4, ge=1, le=8)
-    chunk_size_tokens: int = Field(default=400, ge=300, le=500)
-    chunk_overlap_tokens: int = Field(default=64, ge=50, le=80)
-    retrieval_mode: Literal["hybrid", "semantic"] = "hybrid"
-    retrieval_candidates_per_method: int = Field(default=12, ge=1, le=100)
-    retrieval_top_k: int = Field(default=5, ge=1, le=20)
-    retrieval_neighbor_window: int = Field(default=1, ge=0, le=3)
-    retrieval_context_tokens: int = Field(default=3000, ge=500, le=16000)
-    retrieval_rrf_k: int = Field(default=60, ge=1, le=1000)
     mailbox_provider_mode: Literal["real", "fake"] = "fake"
     enabled_mailbox_methods: str = "gmail_oauth,microsoft_oauth"
     imap_poll_seconds: int = Field(default=60, ge=30, le=900)
@@ -102,8 +68,6 @@ class Settings(BaseSettings):
     microsoft_authority: str = "https://login.microsoftonline.com/common"
     document_converter_url: str = "http://127.0.0.1:8300"
     document_conversion_timeout_seconds: int = Field(default=60, ge=1, le=120)
-    hnsw_ef_search: int = 40
-    aws_region: str = "ap-south-1"
     clamav_host: str = "127.0.0.1"
     clamav_port: int = 3310
     session_seconds: int = 3600
@@ -114,12 +78,7 @@ class Settings(BaseSettings):
     max_job_attempts: int = 3
     worker_poll_seconds: float = 1.0
 
-    @field_validator("embedding_dimensions", mode="before")
-    @classmethod
-    def parse_embedding_dimensions(cls, value: object) -> object:
-        return 1536 if isinstance(value, str) and value.strip() == "1536" else value
-
-    @field_validator("llm_provider", "embedding_provider")
+    @field_validator("llm_provider")
     @classmethod
     def validate_ai_provider(cls, value: str) -> str:
         value = value.strip()
@@ -127,7 +86,7 @@ class Settings(BaseSettings):
             raise ValueError("Use a provider name; select local fakes with provider_mode instead.")
         return value
 
-    @field_validator("llm_api_key", "openai_api_key", "embedding_api_key", mode="before")
+    @field_validator("llm_api_key", "openai_api_key", mode="before")
     @classmethod
     def empty_ai_key_is_unset(cls, value: object) -> object:
         raw = value.get_secret_value() if isinstance(value, SecretStr) else value
@@ -135,7 +94,7 @@ class Settings(BaseSettings):
             return raw.strip() or None
         return value
 
-    @field_validator("llm_base_url", "embedding_base_url")
+    @field_validator("llm_base_url")
     @classmethod
     def validate_ai_endpoint(cls, value: str) -> str:
         endpoint = urlsplit(value)
@@ -159,10 +118,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def production_guards(self) -> "Settings":
-        if self.full_text_output_tokens >= self.full_text_request_tokens:
-            raise ValueError("Full-text output tokens must be less than the total request budget.")
-        if self.experience_output_tokens >= self.experience_request_tokens:
-            raise ValueError("Experience output tokens must be less than the total request budget.")
+        if self.llm_output_tokens >= self.llm_request_tokens:
+            raise ValueError("LLM output tokens must be less than the total request budget.")
         methods = [
             value.strip() for value in self.enabled_mailbox_methods.split(",") if value.strip()
         ]
@@ -183,8 +140,6 @@ class Settings(BaseSettings):
             raise ValueError(
                 "Responses requires json_schema output; use chat_completions otherwise"
             )
-        if self.retrieval_top_k > self.retrieval_candidates_per_method:
-            raise ValueError("Retrieval top K cannot exceed the candidates per method.")
         for origin in (self.public_app_url, self.public_webhook_url):
             if origin is None:
                 continue
@@ -242,43 +197,3 @@ class Settings(BaseSettings):
         if self.llm_base_url.rstrip("/") == OPENAI_BASE_URL:
             return self.openai_api_key
         return None
-
-    def embedding_key(self) -> SecretStr | None:
-        if self.embedding_api_key and self.embedding_api_key.get_secret_value():
-            return self.embedding_api_key
-        if self.embedding_base_url.rstrip("/") == OPENAI_BASE_URL:
-            if self.llm_base_url.rstrip("/") == OPENAI_BASE_URL:
-                return self.llm_key()
-            return self.openai_api_key
-        return None
-
-    def processing_snapshot(self) -> dict[str, str | int | float]:
-        fields = (
-            "llm_provider",
-            "llm_base_url",
-            "llm_output_mode",
-            "llm_timeout_seconds",
-            "embedding_provider",
-            "embedding_base_url",
-            "embedding_model",
-            "embedding_dimensions",
-            "embedding_revision",
-            "embedding_send_dimensions",
-            "embedding_batch_size",
-            "embedding_max_batch_tokens",
-            "embedding_timeout_seconds",
-            "embedding_max_parallel_calls",
-            "profile_model",
-            "grader_model",
-            "chunk_size_tokens",
-            "chunk_overlap_tokens",
-            "retrieval_mode",
-            "retrieval_candidates_per_method",
-            "retrieval_top_k",
-            "retrieval_neighbor_window",
-            "retrieval_context_tokens",
-            "retrieval_rrf_k",
-        )
-        snapshot = {field: getattr(self, field) for field in fields}
-        snapshot["llm_api_format"] = self.llm_api()
-        return snapshot

@@ -1,9 +1,13 @@
+import os
+from uuid import uuid4
+
 import psycopg
 import pytest
 from alembic.config import Config
-from alembic.script import ScriptDirectory
+from sqlalchemy.engine import make_url
 
 from alembic import command
+from scripts.migrate import upgrade_database
 from tests.conftest import ROOT
 
 
@@ -35,9 +39,9 @@ def test_database_has_forced_rls_utc_columns_and_safe_roles(clean_database, admi
         assert (
             connection.execute("""
             SELECT count(*) FROM pg_indexes WHERE indexname IN
-                ('uq_active_application','uq_opening_intake_current','ix_chunk_vector')
+                ('uq_active_application','uq_opening_intake_current')
         """).fetchone()[0]
-            == 3
+            == 2
         )
         assert connection.execute("""
             SELECT has_column_privilege(
@@ -46,231 +50,193 @@ def test_database_has_forced_rls_utc_columns_and_safe_roles(clean_database, admi
         """).fetchone() == (True, False)
 
 
-def test_fresh_install_and_seeded_upgrade(clean_database, admin_url: str) -> None:
-    config = Config(str(ROOT / "alembic.ini"))
-    command.downgrade(config, "base")
-    command.upgrade(config, "0001_identity_tenancy")
+def test_plain_postgres_bootstrap_has_no_vector_artifacts(clean_database, admin_url):
     with psycopg.connect(admin_url) as connection:
-        connection.execute("""
-            INSERT INTO users(id, created_at, email, password_hash)
-            VALUES (gen_random_uuid(), now(), 'migration-fixture@example.org', 'not-a-login-hash')
-        """)
-    command.upgrade(config, "head")
-    with psycopg.connect(admin_url) as connection:
-        assert (
-            connection.execute(
-                "SELECT email FROM users WHERE email = 'migration-fixture@example.org'"
-            ).fetchone()[0]
-            == "migration-fixture@example.org"
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
+            "0015_cv_json_matching",
         )
-        assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
-            ScriptDirectory.from_config(config).get_current_head()
-        )
-    command.downgrade(config, "0002_cv_matching")
-    command.upgrade(config, "head")
-    command.downgrade(config, "0004_better_auth")
-    command.upgrade(config, "head")
+        assert not connection.execute(
+            "SELECT 1 FROM pg_extension WHERE extname='vector'"
+        ).fetchone()
+        assert connection.execute(
+            "SELECT to_regclass('resume_chunks'), to_regclass('cv_embedding_batches')"
+        ).fetchone() == (None, None)
+        assert not connection.execute("""
+            SELECT 1 FROM information_schema.columns WHERE table_schema='public'
+            AND (column_name LIKE 'embedding%' OR column_name='scoring_strategy')
+        """).fetchone()
 
 
 def test_models_match_reviewed_migrations(clean_database) -> None:
     command.check(Config(str(ROOT / "alembic.ini")))
 
 
-def test_phase1_legacy_ownership_keys_upgrade_without_rewriting_history(clean_database, admin_url):
-    config = Config(str(ROOT / "alembic.ini"))
-    command.downgrade(config, "0005_review_retention_permission")
-    # Reproduce the weaker keys found in an earlier Phase 1 local installation.
-    # All fixture DDL stays in the dedicated, empty test database.
-    with psycopg.connect(admin_url) as connection:
-        connection.execute("""
-            ALTER TABLE applications DROP CONSTRAINT fk_latest_match;
-            DO $$ DECLARE item record; BEGIN
-                FOR item IN SELECT conrelid::regclass AS relation,conname FROM pg_constraint
-                    WHERE contype='f' AND (
-                        (conrelid='match_runs'::regclass AND confrelid='resumes'::regclass) OR
-                        (conrelid='review_decisions'::regclass
-                            AND confrelid='match_runs'::regclass))
-                LOOP EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I',item.relation,item.conname);
-                END LOOP;
-                FOR item IN SELECT conrelid::regclass AS relation,conname FROM pg_constraint
-                    WHERE contype='u' AND conrelid IN ('resumes'::regclass,'match_runs'::regclass)
-                        AND pg_get_constraintdef(oid)='UNIQUE (tenant_id, application_id, id)'
-                LOOP EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I',item.relation,item.conname);
-                END LOOP;
-            END $$;
-            ALTER TABLE applications ADD CONSTRAINT fk_latest_match
-                FOREIGN KEY(tenant_id,latest_match_id) REFERENCES match_runs(tenant_id,id)
-                DEFERRABLE INITIALLY DEFERRED;
-            ALTER TABLE match_runs ADD CONSTRAINT legacy_match_resume
-                FOREIGN KEY(tenant_id,resume_id) REFERENCES resumes(tenant_id,id) ON DELETE CASCADE;
-            ALTER TABLE review_decisions ADD CONSTRAINT legacy_review_match
-                FOREIGN KEY(tenant_id,match_id) REFERENCES match_runs(tenant_id,id)
-                    ON DELETE CASCADE;
-        """)
-    command.upgrade(config, "head")
-    command.check(config)
-    with psycopg.connect(admin_url) as connection:
-        keys = connection.execute("""
-            SELECT pg_get_constraintdef(oid) FROM pg_constraint
-                WHERE conname IN ('fk_latest_match','fk_match_resume_scope','fk_review_match_scope')
-        """).fetchall()
-        assert len(keys) == 3
-        assert all("application_id" in definition for (definition,) in keys)
+def test_populated_0014_upgrade_keeps_history_and_resumes_pending_intake(monkeypatch):
+    url = os.environ.get("RECRUITMENT_LEGACY_TEST_ADMIN_URL")
+    if not url:
+        pytest.skip("Supply a dedicated, empty Frontdesk 0014 upgrade fixture.")
+    tenant, actor, opening, future = (uuid4() for _ in range(4))
+    candidate, app, file_id, upload, resume, criteria, match = (uuid4() for _ in range(7))
+    pending, pending_file, job = (uuid4() for _ in range(3))
+    with psycopg.connect(url) as db:
+        name, revision, empty = db.execute("""
+            SELECT current_database(),version_num,
+                NOT EXISTS (SELECT 1 FROM tenants) FROM alembic_version
+        """).fetchone()
+        assert name.startswith("frontdesk_0015_upgrade_")
+        assert revision == "0014_full_text_scoring" and empty
+        db.execute(
+            """
+            INSERT INTO users(id,created_at,email) VALUES(%s,now(),'upgrade@example.org')
+        """,
+            (actor,),
+        )
+        db.execute(
+            """
+            INSERT INTO tenants(id,created_at,name,timezone)
+            VALUES(%s,now(),'Upgrade fixture','Asia/Kolkata')
+        """,
+            (tenant,),
+        )
+        db.execute(
+            """
+            INSERT INTO tenant_members(id,created_at,tenant_id,user_id,role)
+            VALUES(gen_random_uuid(),now(),%s,%s,'recruiter')
+        """,
+            (tenant, actor),
+        )
+        db.execute(
+            """
+            INSERT INTO job_openings(id,created_at,tenant_id,title,job_description,status)
+            VALUES(%s,now()-interval '2 days',%s,'Original role','Python development','active'),
+                  (%s,now(),%s,'Future role','JavaScript development','active')
+        """,
+            (opening, tenant, future, tenant),
+        )
+        db.execute(
+            """
+            INSERT INTO opening_intake_periods(id,created_at,tenant_id,opening_id,starts_at)
+            VALUES(gen_random_uuid(),now(),%s,%s,now()-interval '2 days'),
+                  (gen_random_uuid(),now(),%s,%s,now())
+        """,
+            (tenant, opening, tenant, future),
+        )
+        db.execute(
+            """
+            INSERT INTO candidates(id,created_at,tenant_id,profile)
+            VALUES(%s,now(),%s,'{"name":"Fictional Candidate"}')
+        """,
+            (candidate, tenant),
+        )
+        db.execute(
+            """
+            INSERT INTO applications(id,created_at,tenant_id,candidate_id,opening_id,status,
+                                     last_activity_at,retention_expires_at,lock_version)
+            VALUES(%s,now(),%s,%s,%s,'shortlisted',now(),now()+interval '7 days',1)
+        """,
+            (app, tenant, candidate, opening),
+        )
+        db.execute(
+            """
+            INSERT INTO resume_files(id,created_at,tenant_id,sha256,content,mime_type,byte_length)
+            VALUES(%s,now(),%s,%s,%s,'application/pdf',7),
+                  (%s,now(),%s,%s,%s,'application/pdf',7)
+        """,
+            (file_id, tenant, "a" * 64, b"tracked", pending_file, tenant, "b" * 64, b"pending"),
+        )
+        db.execute(
+            """
+            INSERT INTO cv_uploads(id,created_at,tenant_id,file_id,opening_id,application_id,status,
+                                   retention_expires_at,source_received_at)
+            VALUES(%s,now(),%s,%s,%s,%s,'completed',now()+interval '7 days',now()-interval '1 day'),
+                  (%s,now(),%s,%s,%s,NULL,'embedding',now()+interval '7 days',
+                   now()-interval '1 day')
+        """,
+            (upload, tenant, file_id, opening, app, pending, tenant, pending_file, opening),
+        )
+        db.execute(
+            """
+            INSERT INTO resumes(id,created_at,tenant_id,application_id,upload_id,version)
+            VALUES(%s,now(),%s,%s,%s,1)
+        """,
+            (resume, tenant, app, upload),
+        )
+        db.execute(
+            """
+            INSERT INTO job_criteria_versions(id,created_at,tenant_id,opening_id,version,
+                shortlist_threshold,source_revision)
+            VALUES(%s,now(),%s,%s,1,75,1)
+        """,
+            (criteria, tenant, opening),
+        )
+        db.execute(
+            """
+            INSERT INTO match_runs(id,created_at,tenant_id,application_id,resume_id,
+                criteria_version_id,recommendation,score,reason,model,provider,prompt_version,
+                embedding_model,embedding_dimensions,embedding_fingerprint,
+                missing_required_criteria,
+                processed_at)
+            VALUES(%s,now(),%s,%s,%s,%s,'recommended_shortlist',91,'Historical reason',
+                'fake','fake','legacy','fake',1536,'legacy','[]',now())
+        """,
+            (match, tenant, app, resume, criteria),
+        )
+        db.execute(
+            """
+            INSERT INTO review_decisions(id,created_at,tenant_id,application_id,match_id,
+                                         recruiter_id,decision)
+            VALUES(gen_random_uuid(),now(),%s,%s,%s,%s,'shortlist')
+        """,
+            (tenant, app, match, actor),
+        )
+        db.execute(
+            """
+            UPDATE applications SET current_resume_id=%s,latest_match_id=%s WHERE id=%s
+        """,
+            (resume, match, app),
+        )
+        db.execute(
+            """
+            INSERT INTO resume_chunks(id,created_at,tenant_id,resume_id,position,source_spans,
+                text,scoring_text,token_start,token_end,embedding,embedding_model,
+                embedding_dimensions)
+            VALUES(gen_random_uuid(),now(),%s,%s,0,'[]','Past text','Past text',0,2,%s,'fake',1536)
+        """,
+            (tenant, resume, "[" + ",".join(["1"] + ["0"] * 1535) + "]"),
+        )
+        db.execute(
+            """
+            INSERT INTO job_runs(id,created_at,tenant_id,kind,aggregate_id,dedupe_key,state,
+                attempts,available_at,lease_token,lease_expires_at)
+            VALUES(%s,now(),%s,'cv.uploaded',%s,'fixture:pending','running',1,now(),
+                gen_random_uuid(),now()+interval '10 minutes')
+        """,
+            (job, tenant, pending),
+        )
 
-
-def test_populated_phase2_downgrade_refuses_to_discard_processing_records(context, cv, admin_url):
-    context.upload(cv)
-    context.drain()
-    config = Config(str(ROOT / "alembic.ini"))
-    with pytest.raises(
-        Exception, match="Preserve (processing snapshots|opening setup|experience evaluations)"
-    ):
-        command.downgrade(config, "0005_review_retention_permission")
-    with psycopg.connect(admin_url) as connection:
-        assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
-            ScriptDirectory.from_config(config).get_current_head()
+    target = make_url(url).set(drivername="postgresql+psycopg")
+    monkeypatch.setenv("RECRUITMENT_MIGRATION_DATABASE_URL", target.render_as_string(False))
+    upgrade_database()
+    with psycopg.connect(url) as db:
+        assert db.execute(
+            "SELECT score,reason FROM match_runs WHERE id=%s", (match,)
+        ).fetchone() == (
+            91,
+            "Historical reason",
         )
-        assert connection.execute("SELECT count(*) FROM cv_processing_snapshots").fetchone()[0] == 1
-
-
-def test_mailbox_method_upgrade_preserves_oauth_and_candidate_records(
-    clean_database, cv, admin_url
-):
-    import hashlib
-    from uuid import uuid4
-
-    config = Config(str(ROOT / "alembic.ini"))
-    command.downgrade(config, "0010_mail_thread_correlation")
-    ids = {
-        name: uuid4()
-        for name in (
-            "user",
-            "tenant",
-            "opening",
-            "version",
-            "candidate",
-            "file",
-            "app",
-            "upload",
-            "mailbox",
+        assert db.execute("SELECT decision FROM review_decisions").fetchone() == ("shortlist",)
+        assert db.execute(
+            "SELECT content FROM resume_files WHERE id=%s", (file_id,)
+        ).fetchone() == (b"tracked",)
+        status, scope = db.execute(
+            "SELECT status,matching_openings FROM cv_uploads WHERE id=%s", (pending,)
+        ).fetchone()
+        assert status == "queued" and [item["opening_id"] for item in scope] == [str(opening)]
+        assert db.execute(
+            "SELECT state,lease_token FROM job_runs WHERE id=%s", (job,)
+        ).fetchone() == (
+            "queued",
+            None,
         )
-    }
-    with psycopg.connect(admin_url) as connection:
-        connection.execute(
-            (
-                "INSERT INTO users(id,created_at,email,password_hash) VALUES(%s,now(),"
-                "'upgrade@example.org','not-a-login-hash')"
-            ),
-            (ids["user"],),
-        )
-        connection.execute(
-            (
-                "INSERT INTO tenants(id,created_at,name,timezone) VALUES(%s,now(),'Upgrade "
-                "fixture','Asia/Kolkata')"
-            ),
-            (ids["tenant"],),
-        )
-        connection.execute(
-            (
-                "INSERT INTO job_openings(id,created_at,tenant_id,title,job_description,"
-                "status) VALUES(%s,now(),%s,'Legacy job','Python development','active')"
-            ),
-            (ids["opening"], ids["tenant"]),
-        )
-        connection.execute(
-            (
-                "INSERT INTO job_criteria_versions(id,created_at,tenant_id,opening_id,"
-                "version,shortlist_threshold) VALUES(%s,now(),%s,%s,1,83)"
-            ),
-            (ids["version"], ids["tenant"], ids["opening"]),
-        )
-        connection.execute(
-            (
-                "INSERT INTO job_criteria(id,created_at,tenant_id,version_id,position,text,"
-                "required,strict,weight) VALUES(gen_random_uuid(),now(),%s,%s,0,'Python "
-                "development',true,false,7)"
-            ),
-            (ids["tenant"], ids["version"]),
-        )
-        connection.execute(
-            ("INSERT INTO candidates(id,created_at,tenant_id,profile) VALUES(%s,now(),%s,'{}')"),
-            (ids["candidate"], ids["tenant"]),
-        )
-        connection.execute(
-            (
-                "INSERT INTO resume_files(id,created_at,tenant_id,sha256,content,mime_type,"
-                "byte_length) VALUES(%s,now(),%s,%s,%s,'application/pdf',%s)"
-            ),
-            (ids["file"], ids["tenant"], hashlib.sha256(cv).hexdigest(), cv, len(cv)),
-        )
-        connection.execute(
-            (
-                "INSERT INTO applications(id,created_at,tenant_id,candidate_id,opening_id,"
-                "status,lock_version,last_activity_at,retention_expires_at) VALUES(%s,"
-                "now(),%s,%s,%s,'needs_review',1,now(),now()+interval '30 days')"
-            ),
-            (ids["app"], ids["tenant"], ids["candidate"], ids["opening"]),
-        )
-        connection.execute(
-            (
-                "INSERT INTO cv_uploads(id,created_at,tenant_id,file_id,opening_id,"
-                "application_id,status,retention_expires_at,source_received_at) VALUES(%s,"
-                "now(),%s,%s,%s,%s,'needs_review',now()+interval '30 days',now())"
-            ),
-            (ids["upload"], ids["tenant"], ids["file"], ids["opening"], ids["app"]),
-        )
-        connection.execute(
-            (
-                "INSERT INTO cv_processing_snapshots(id,created_at,tenant_id,upload_id,"
-                "fingerprint,config) VALUES(gen_random_uuid(),now(),%s,%s,'legacy-fixture',"
-                "'{}')"
-            ),
-            (ids["tenant"], ids["upload"]),
-        )
-        connection.execute(
-            (
-                "INSERT INTO mailbox_connections(id,created_at,tenant_id,provider,"
-                "recruiter_id,opening_id,status,email,folder_id,intake_started_at,cursor,"
-                "generation,source_period,sync_status) VALUES(%s,now(),%s,'gmail',%s,%s,"
-                "'connected','migration@example.org','INBOX',now(),'{}',1,1,'idle')"
-            ),
-            (ids["mailbox"], ids["tenant"], ids["user"], ids["opening"]),
-        )
-    command.upgrade(config, "head")
-    command.check(config)
-    with psycopg.connect(admin_url) as connection:
-        assert (
-            connection.execute(
-                "SELECT connection_method FROM mailbox_connections WHERE id=%s", (ids["mailbox"],)
-            ).fetchone()[0]
-            == "gmail_oauth"
-        )
-        for table in ("candidates", "applications", "cv_uploads", "cv_processing_snapshots"):
-            assert connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 1
-        assert (
-            connection.execute("SELECT shortlist_threshold FROM job_criteria_versions").fetchone()[
-                0
-            ]
-            == 83
-        )
-        assert connection.execute("SELECT weight FROM job_criteria").fetchone()[0] == 7
-        assert (
-            connection.execute("SELECT criteria_status FROM job_openings").fetchone()[0] == "ready"
-        )
-        assert connection.execute("SELECT count(*) FROM opening_intake_periods").fetchone()[0] == 1
-
-
-def test_method_downgrade_preserves_imap_connections(context, admin_url):
-    from tests.integration.test_imap_connections import connect_imap
-
-    mailbox = connect_imap(context)
-    config = Config(str(ROOT / "alembic.ini"))
-    with pytest.raises(Exception, match="Preserve (IMAP connections|opening setup)"):
-        command.downgrade(config, "0010_mail_thread_correlation")
-    with psycopg.connect(admin_url) as connection:
-        assert (
-            connection.execute(
-                "SELECT connection_method FROM mailbox_connections WHERE id=%s", (mailbox["id"],)
-            ).fetchone()[0]
-            == "imap"
-        )
+        assert db.execute("SELECT to_regclass('resume_chunks')").fetchone() == (None,)
+        assert not db.execute("SELECT 1 FROM pg_extension WHERE extname='vector'").fetchone()

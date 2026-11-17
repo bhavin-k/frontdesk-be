@@ -162,7 +162,7 @@ def test_http_failures_are_bounded_and_sanitized(monkeypatch, status, code, retr
     assert "sensitive" not in str(failure.value)
 
 
-def test_http_payload_limit_and_vector_overflow(settings, monkeypatch):
+def test_http_payload_limit(settings, monkeypatch):
     original = httpx.Client
     transport = httpx.MockTransport(lambda request: httpx.Response(200, content=b"x" * 50))
     monkeypatch.setattr(
@@ -170,10 +170,6 @@ def test_http_payload_limit_and_vector_overflow(settings, monkeypatch):
     )
     with pytest.raises(ProviderError, match="PROVIDER_RESPONSE_TOO_LARGE"):
         mail_http.provider_request(microsoft.ORIGIN, "GET", "me", "local-contract-value", limit=10)
-    from recruitment.adapters.ai import validate_vectors
-
-    with pytest.raises(ProviderError, match="INVALID_EMBEDDING"):
-        validate_vectors([[1e308] * 1536], 1)
 
 
 def test_locked_http_transport_initializes_without_optional_network_backends():

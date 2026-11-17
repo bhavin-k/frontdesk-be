@@ -1,119 +1,54 @@
 import json
-import secrets
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
-import httpx
-import pytest
-from openai import OpenAI
-
-from recruitment.adapters.ai import CompatibleEmbeddings, LLMGrader, LLMProfiles
-from recruitment.domain.contracts import EvidenceInput
-from tests.unit.test_ai_configuration import chat_response
+from recruitment.adapters.ai import CVParser, JDMatcher
+from recruitment.adapters.fakes import FakeProfiles
 
 
-@pytest.mark.parametrize("invalid_profile", [False, True])
-def test_upload_processing_through_compatible_endpoints(context, cv, invalid_profile):
-    original = context.providers
-    fake_profiles, fake_grader, fake_embeddings = (
-        original.profiles,
-        original.grader,
-        original.embeddings,
+def test_pipeline_passes_only_structured_masked_profile_to_matcher(context, cv):
+    client = MagicMock()
+    profile = FakeProfiles().profile(
+        "Fictional Candidate\nfictional@example.org\n4 years in Python"
     )
-    settings = context.settings
-    settings.llm_provider = "llm-gateway"
-    settings.llm_base_url = "https://llm.example.invalid/v1"
-    settings.profile_model, settings.grader_model = "vendor/profile", "vendor/grader"
-    settings.llm_output_mode = "json_object"
-    settings.embedding_provider = "vector-service"
-    settings.embedding_base_url = "https://vectors.example.invalid/v1"
-    settings.embedding_model = "custom-vectors"
-    requests = []
+    match = {
+        "fit": True,
+        "score": 96,
+        "matched": ["Python"],
+        "missing": [],
+        "exp_ok": True,
+        "reason": "The CV lists Python development.",
+    }
 
-    def respond(request):
-        body = json.loads(request.content)
-        requests.append((request.url.host, request.url.path, body["model"]))
-        if request.url.path == "/v1/embeddings":
-            vectors = fake_embeddings.embed(body["input"])
-            return httpx.Response(
-                200,
-                json={
-                    "object": "list",
-                    "model": settings.embedding_model,
-                    "data": [{"index": i, "embedding": vector} for i, vector in enumerate(vectors)],
-                },
-            )
-        value = json.loads(body["messages"][1]["content"])
-        if body["model"] == settings.profile_model:
-            result = (
-                "{}"
-                if invalid_profile
-                else fake_profiles.profile(value["cv_reference_text"]).model_dump_json()
-            )
-        else:
-            result = fake_grader.grade(
-                value["criterion"],
-                [EvidenceInput.model_validate(chunk) for chunk in value["chunks"]],
-            ).model_dump_json()
-        return httpx.Response(200, json=chat_response(result))
+    def completion(content):
+        return SimpleNamespace(
+            usage=None,
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(refusal=None, content=content),
+                )
+            ],
+        )
 
-    with (
-        OpenAI(
-            api_key=secrets.token_urlsafe(32),
-            base_url=settings.llm_base_url,
-            max_retries=0,
-            http_client=httpx.Client(transport=httpx.MockTransport(respond)),
-        ) as llm,
-        OpenAI(
-            api_key=secrets.token_urlsafe(32),
-            base_url=settings.embedding_base_url,
-            max_retries=0,
-            http_client=httpx.Client(transport=httpx.MockTransport(respond)),
-        ) as embeddings,
-    ):
-        original.name = settings.llm_provider
-        original.profiles = LLMProfiles(
-            llm, settings.profile_model, "profile-v1", "chat_completions", "json_object"
-        )
-        original.grader = LLMGrader(
-            llm, settings.grader_model, "matching-v1", "chat_completions", "json_object"
-        )
-        original.embeddings = CompatibleEmbeddings(embeddings, settings.embedding_model)
-        if not invalid_profile:
-            changed = context.client.patch(
-                f"{context.base}/openings/{context.opening}",
-                headers=context.headers,
-                json={
-                    "title": "Python Developer",
-                    "job_description": "Python development via compatible endpoints",
-                    "expected_revision": 1,
-                },
-            )
-            assert changed.status_code == 200
-            context.drain()
-        uploaded = context.upload(cv).json()["upload_id"]
-        context.drain()
-        if invalid_profile:
-            status = context.client.get(
-                f"{context.base}/cv-uploads/{uploaded}", headers=context.headers
-            ).json()
-            assert status["status"] == "needs_review"
-            assert status["review_reason"] == "INVALID_MODEL_OUTPUT"
-            assert all(request[2] == settings.profile_model for request in requests)
-        else:
-            result = context.result(uploaded)
-            assert result["criteria"][0]["evidence"]
-            assert result["score"] is not None
-            assert (
-                "llm.example.invalid",
-                "/v1/chat/completions",
-                settings.profile_model,
-            ) in requests
-            assert (
-                "llm.example.invalid",
-                "/v1/chat/completions",
-                settings.grader_model,
-            ) in requests
-            assert (
-                "vectors.example.invalid",
-                "/v1/embeddings",
-                settings.embedding_model,
-            ) in requests
+    client.chat.completions.create.side_effect = [
+        completion("invalid JSON"),
+        completion(profile.model_dump_json()),
+        completion(json.dumps(match)),
+    ]
+    args = (client, "test-model")
+    context.providers.profiles = CVParser(*args, "cv-parser-v1", "chat_completions", "json_object")
+    context.providers.matcher = JDMatcher(*args, "jd-matcher-v1", "chat_completions", "json_object")
+    upload = context.upload(cv).json()
+    context.drain()
+    assert context.result(upload["upload_id"])["score"] == 96
+
+    parse, retry, score = client.chat.completions.create.call_args_list
+    raw = json.loads(parse.kwargs["messages"][1]["content"])
+    assert set(raw) == {"cv_reference_text"} and "candidate@example.org" in raw["cv_reference_text"]
+    assert parse.kwargs["messages"][1] == retry.kwargs["messages"][1]
+    payload = json.loads(score.kwargs["messages"][1]["content"])
+    assert payload["job"]["title"] == "Python Developer"
+    assert payload["cv"]["email"] == payload["cv"]["name"] == payload["cv"]["phone"] == ""
+    assert payload["cv"]["total_experience_years"] == 4
+    assert all(not call.kwargs["store"] for call in (parse, retry, score))

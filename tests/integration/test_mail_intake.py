@@ -10,7 +10,6 @@ from recruitment.adapters.db.models import (
     Application,
     Candidate,
     CVUpload,
-    ResumeChunk,
     ResumeFile,
 )
 from recruitment.adapters.db.phase2 import (
@@ -18,7 +17,6 @@ from recruitment.adapters.db.phase2 import (
     Mailbox,
     MailboxCredential,
     MailMessage,
-    ProcessingSnapshot,
 )
 from recruitment.adapters.mail_fake import FakeMailboxProvider
 from recruitment.core.time import utcnow
@@ -95,9 +93,7 @@ def test_only_new_mail_enters_the_complete_cv_pipeline(
     ]
     assert len(intake) == 1 and intake[0]["status"] == "completed", intake
     result = context.result(intake[0]["upload_id"])
-    assert result["score"] == 100 and result["criteria"][0]["evidence"]
-    assert result["embedding_fingerprint"] != "legacy-unfingerprinted"
-    assert result["processing_config"]["actual_embedding_model"] == "fake-embedding-v1"
+    assert result["score"] == 100 and result["matched"] == ["Python"]
     candidates = context.client.get(f"{context.base}/candidates", headers=context.headers).json()[
         "items"
     ]
@@ -111,14 +107,6 @@ def test_only_new_mail_enters_the_complete_cv_pipeline(
     with db.transaction(db.api, UUID(context.tenant), UUID(context.user_id)) as session:
         assert session.scalar(select(MailMessage.provider_message_id)) != old.id
         assert session.scalar(select(ResumeFile.content)) == cv
-        assert (
-            session.scalar(select(ResumeChunk.embedding_fingerprint))
-            == result["embedding_fingerprint"]
-        )
-        assert (
-            session.scalar(select(ProcessingSnapshot.fingerprint))
-            == result["embedding_fingerprint"]
-        )
 
 
 def test_provider_returning_old_bootstrap_items_cannot_bypass_cutoff(
@@ -147,8 +135,8 @@ def test_candidate_contact_is_never_filled_from_mailbox(context: Context) -> Non
     candidate = context.client.get(f"{context.base}/candidates", headers=context.headers).json()[
         "items"
     ][0]
-    assert candidate["profile"]["email"] is None
-    assert candidate["profile"]["mobile"] is None
+    assert candidate["profile"]["email"] == ""
+    assert candidate["profile"]["phone"] == ""
 
 
 def test_email_and_upload_duplicates_share_one_application(context: Context, cv: bytes) -> None:

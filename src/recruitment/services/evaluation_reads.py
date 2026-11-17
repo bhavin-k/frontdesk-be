@@ -6,83 +6,44 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from recruitment.adapters.db.matching import MatchingEvaluation, RoleAssessment
-from recruitment.adapters.db.models import (
-    Application,
-    CriteriaVersion,
-    CriterionResult,
-    JobCriterion,
-    MatchRun,
-    Opening,
-    ReviewDecision,
-)
+from recruitment.adapters.db.models import Application, MatchRun, Opening, ReviewDecision
 from recruitment.services.common import missing
 
 
-def match_read(
-    session: Session, run: MatchRun, role: RoleAssessment | None = None
-) -> dict[str, Any]:
-    version = session.get(CriteriaVersion, run.criteria_version_id)
-    assert version is not None
-    opening = session.get(Opening, version.opening_id)
-    criteria = {
-        item.id: item
-        for item in session.scalars(
-            select(JobCriterion).where(JobCriterion.version_id == version.id)
-        )
-    }
-    grades = list(
-        session.scalars(select(CriterionResult).where(CriterionResult.match_id == run.id))
-    )
-    grades.sort(key=lambda item: criteria[item.criterion_id].position)
+def legacy_match(run: MatchRun) -> dict[str, Any]:
     return {
-        "application_id": run.application_id,
         "match_run_id": run.id,
-        "criteria_version_id": version.id,
-        "opening_id": version.opening_id,
-        "opening_title": opening.title if opening else None,
         "score": run.score,
-        "score_provisional": role.provisional if role else False,
-        "confidence": role.confidence if role else None,
-        "shortlist_threshold": version.shortlist_threshold,
         "recommendation": run.recommendation,
         "reason": run.reason,
-        "model": run.model,
-        "provider": run.provider,
-        "prompt_version": run.prompt_version,
-        "scoring_strategy": run.scoring_strategy,
-        "embedding_model": run.embedding_model,
-        "embedding_dimensions": run.embedding_dimensions,
-        "embedding_fingerprint": run.embedding_fingerprint,
-        "processing_config": run.processing_config,
-        "missing_required_criteria": run.missing_required_criteria,
-        "processed_at": run.processed_at,
-        "criteria": [
-            {
-                "criterion_id": grade.criterion_id,
-                "criterion": criteria[grade.criterion_id].text,
-                "required": criteria[grade.criterion_id].required,
-                "strict": criteria[grade.criterion_id].strict,
-                "weight": criteria[grade.criterion_id].weight,
-                "status": grade.status,
-                "confidence": grade.confidence,
-                "reason": grade.reason,
-                "evidence": grade.evidence,
-            }
-            for grade in grades
-        ],
     }
 
 
-def assessment_read(session: Session, role: RoleAssessment) -> dict[str, Any]:
+def role_match(session: Session, role: RoleAssessment) -> dict[str, Any] | None:
+    if role.match_result is not None:
+        return role.match_result
+    run = session.get(MatchRun, role.match_run_id) if role.match_run_id else None
+    return legacy_match(run) if run else None
+
+
+def assessment_read(
+    session: Session, role: RoleAssessment, evaluation: MatchingEvaluation
+) -> dict[str, Any]:
     opening = session.get(Opening, role.opening_id)
+    source = next(
+        (item for item in evaluation.role_snapshot if item["opening_id"] == str(role.opening_id)),
+        {},
+    )
     return {
         "id": role.id,
         "opening_id": role.opening_id,
-        "opening_title": opening.title if opening else "",
+        "opening_title": source.get("jd", {}).get("title")
+        or source.get("title")
+        or (opening.title if opening else ""),
         "opening_status": opening.status if opening else "closed",
         "state": role.state,
         "criteria_version_id": role.criteria_version_id,
-        "eligibility": role.eligibility,
+        "match_result": role.match_result,
         "score": role.score,
         "score_provisional": role.provisional,
         "confidence": role.confidence,
@@ -110,11 +71,10 @@ def read_results(session: Session, app: Application) -> dict[str, Any]:
         best = next(
             (role for role in roles if role.id == evaluation.recommended_assessment_id), None
         )
-        run = session.get(MatchRun, best.match_run_id) if best and best.match_run_id else None
         return {
             "status": app.status,
-            "result": match_read(session, run, best)
-            if run and evaluation.state == "completed"
+            "result": role_match(session, best)
+            if best and evaluation.state == "completed"
             else None,
             "evaluation": {
                 "id": evaluation.id,
@@ -126,15 +86,13 @@ def read_results(session: Session, app: Application) -> dict[str, Any]:
                 "recommended_assessment_id": evaluation.recommended_assessment_id,
                 "processed_at": evaluation.processed_at,
                 "processing_config": evaluation.config,
-                "roles": [assessment_read(session, role) for role in roles],
+                "roles": [assessment_read(session, role, evaluation) for role in roles],
             },
         }
     run = session.get(MatchRun, app.latest_match_id) if app.latest_match_id else None
     return {
         "status": app.status,
-        "result": match_read(session, run)
-        if run and run.resume_id == app.current_resume_id
-        else None,
+        "result": legacy_match(run) if run and run.resume_id == app.current_resume_id else None,
         "evaluation": None,
     }
 
@@ -154,8 +112,8 @@ def read_assessment(session: Session, app: Application, identifier: Any) -> dict
     if run and (run.application_id != app.id or run.resume_id != evaluation.resume_id):
         raise missing()
     return {
-        "assessment": assessment_read(session, role),
-        "result": match_read(session, run, role) if run else None,
+        "assessment": assessment_read(session, role, evaluation),
+        "result": role_match(session, role),
     }
 
 

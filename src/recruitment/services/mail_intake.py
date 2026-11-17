@@ -22,7 +22,16 @@ from recruitment.adapters.db.phase2 import (
     MailMessage,
     OAuthAttempt,
 )
-from recruitment.adapters.documents import DOC, DOCX, MAX_BYTES, PDF, validate_file
+from recruitment.adapters.documents import (
+    DOC,
+    DOCX,
+    IMAGE_FORMATS,
+    JPEG,
+    MAX_BYTES,
+    PDF,
+    PNG,
+    validate_file,
+)
 from recruitment.adapters.mail_runtime import MailboxRuntime
 from recruitment.adapters.providers import Providers
 from recruitment.core.errors import AppError, ProviderError
@@ -39,7 +48,9 @@ logger = logging.getLogger(__name__)
 
 def attachment_mime(filename: str, declared: str) -> str | None:
     extension = filename.casefold().rsplit(".", 1)[-1]
-    expected = {"pdf": PDF, "docx": DOCX, "doc": DOC}.get(extension)
+    expected = {"pdf": PDF, "docx": DOCX, "doc": DOC, "png": PNG, "jpg": JPEG, "jpeg": JPEG}.get(
+        extension
+    )
     if not expected:
         return None
     return expected if declared in {expected, "application/octet-stream", ""} else None
@@ -203,7 +214,9 @@ class MailboxJobs:
         supported = [
             (item, mime)
             for item in message.attachments
-            if not message.bounce and (mime := attachment_mime(item.filename, item.mime_type))
+            if not message.bounce
+            and (mime := attachment_mime(item.filename, item.mime_type))
+            and not (item.inline and mime in IMAGE_FORMATS)
         ]
         if supported:
             opening = session.scalar(
@@ -334,7 +347,6 @@ class MailboxJobs:
                     content,
                     mime,
                     received,
-                    scoring_strategy=self.queue.settings.scoring_strategy,
                 )
                 item.upload_id, item.status, item.failure_code = upload.id, "completed", None
                 save_credentials(session, self.runtime, row, work.credentials)

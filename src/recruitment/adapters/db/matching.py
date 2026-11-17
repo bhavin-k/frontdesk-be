@@ -46,7 +46,6 @@ class MatchingEvaluation(Owned, Base):
     reason: Mapped[str] = mapped_column(Text, default="Matching is processing.")
     confidence: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
     recommended_assessment_id: Mapped[UUID | None]
-    experience_facts: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
@@ -85,12 +84,11 @@ class RoleAssessment(Owned, Base):
     opening_id: Mapped[UUID]
     criteria_version_id: Mapped[UUID | None]
     state: Mapped[str] = mapped_column(default="pending")
-    eligibility: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     recommendation: Mapped[str] = mapped_column(default="needs_review")
     confidence: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
     score: Mapped[Decimal | None] = mapped_column(Numeric(5, 2))
     provisional: Mapped[bool] = mapped_column(default=False)
     reason: Mapped[str] = mapped_column(Text, default="Matching is processing.")
     match_run_id: Mapped[UUID | None]
-    grade_checkpoints: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    match_result: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     failure_code: Mapped[str | None]

@@ -149,12 +149,15 @@ class GmailIMAPProvider:
             filename = part.get_filename()
             if not part.is_multipart() and filename:
                 content = part.get_payload(decode=True)
+                disposition = part.get_content_disposition()
                 attachments.append(
                     RemoteAttachment(
                         str(position),
                         filename,
                         part.get_content_type(),
                         len(content) if isinstance(content, bytes) else 0,
+                        inline=disposition == "inline"
+                        or (disposition != "attachment" and part.get("Content-ID") is not None),
                     )
                 )
             elif not part.is_multipart() and part.get_content_type() == "text/plain" and not reply:

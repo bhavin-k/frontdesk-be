@@ -176,6 +176,7 @@ class MicrosoftMailboxProvider:
                                 str(row.get("name", "")),
                                 str(row.get("contentType", "")),
                                 int(row.get("size", 0)),
+                                inline=row.get("isInline") is True,
                             )
                         )
                 if len(attachments) > 100:

@@ -6,13 +6,24 @@ from uuid import UUID, uuid4
 from sqlalchemy import select, update
 
 from recruitment.adapters.db.matching import MatchingEvaluation, RoleAssessment
-from recruitment.adapters.db.models import Application, CVUpload, RetentionSetting, ReviewDecision
+from recruitment.adapters.db.models import (
+    Application,
+    CVUpload,
+    Opening,
+    RetentionSetting,
+    ReviewDecision,
+)
 from recruitment.core.errors import AppError
 from recruitment.core.time import utcnow
 from recruitment.domain.retention import deadline
 from recruitment.services.auth import Principal
-from recruitment.services.common import emit, existing_request, missing, remember_request
-from recruitment.services.matching import active_roles
+from recruitment.services.common import (
+    advisory_lock,
+    emit,
+    existing_request,
+    missing,
+    remember_request,
+)
 from recruitment.services.tenancy import TenancyService
 
 
@@ -41,6 +52,7 @@ def decide_evaluation(
         "reason": reason,
     }
     with tenants.scope(principal, tenant_id) as session:
+        advisory_lock(session, f"tenant:{tenant_id}")
         previous = existing_request(session, tenant_id, "decision", key, payload)
         if previous:
             record = session.get(ReviewDecision, previous)
@@ -65,7 +77,6 @@ def decide_evaluation(
             or app.lock_version != expected_version
             or app.rejected_at
             or evaluation.state != "completed"
-            or active_roles(session) != evaluation.role_snapshot
         ):
             raise AppError("STALE_DECISION", "Refresh the current evaluation before deciding.", 409)
         if app.retention_expires_at <= utcnow():
@@ -73,8 +84,12 @@ def decide_evaluation(
         role = session.get(RoleAssessment, role_assessment_id) if role_assessment_id else None
         if role_assessment_id and (not role or role.evaluation_id != evaluation.id):
             raise missing()
-        if decision == "shortlist" and role is None:
-            raise AppError("ROLE_REQUIRED", "Select one active role before saving.", 422)
+        if decision == "shortlist":
+            if role is None:
+                raise AppError("ROLE_REQUIRED", "Select one active role before saving.", 422)
+            opening = session.get(Opening, role.opening_id)
+            if not opening or opening.status != "active":
+                raise AppError("OPENING_NOT_ACTIVE", "Select an active opening.", 409)
         record = ReviewDecision(
             id=uuid4(),
             tenant_id=tenant_id,

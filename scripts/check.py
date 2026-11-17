@@ -13,7 +13,8 @@ def main() -> None:
     environment = os.environ.copy()
     state = ROOT / ".local" / "test-database.json"
     if state.exists():
-        environment.update(json.loads(state.read_text("utf-8"))["environment"])
+        for key, value in json.loads(state.read_text("utf-8"))["environment"].items():
+            environment.setdefault(key, value)
     if not environment.get("RECRUITMENT_TEST_ADMIN_URL"):
         raise SystemExit("Start the dedicated test database before running the complete checks.")
     commands = [

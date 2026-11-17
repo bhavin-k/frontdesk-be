@@ -171,9 +171,12 @@ def resumes(
 )
 def original(tenant_id: UUID, upload_id: UUID, actor: Actor, services: Services) -> Response:
     content, mime = services.candidates.file(actor, tenant_id, upload_id)
-    extension = (
-        "pdf" if mime == "application/pdf" else "doc" if mime == "application/msword" else "docx"
-    )
+    extension = {
+        "application/pdf": "pdf",
+        "application/msword": "doc",
+        "image/jpeg": "jpg",
+        "image/png": "png",
+    }.get(mime, "docx")
     return Response(
         content,
         media_type=mime,

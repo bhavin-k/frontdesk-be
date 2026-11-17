@@ -6,6 +6,7 @@ from email_validator import EmailNotValidError, validate_email
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from recruitment.adapters.db.matching import MatchingEvaluation, RoleAssessment
 from recruitment.adapters.db.models import (
     Application,
     Candidate,
@@ -24,10 +25,9 @@ from recruitment.adapters.db.phase2 import (
     Mailbox,
     MailMessage,
 )
-from recruitment.core.config import Settings
 from recruitment.core.errors import AppError
 from recruitment.core.time import utcnow
-from recruitment.domain.profiles import clean
+from recruitment.domain.profiles import clean, with_contacts
 from recruitment.services.auth import Principal
 from recruitment.services.common import (
     advisory_lock,
@@ -102,8 +102,13 @@ def correct_contacts(
                     tenant_id=candidate.tenant_id, candidate_id=candidate.id, kind=kind, value=value
                 )
             )
-    before = {key: candidate.profile.get(key) for key in values}
-    candidate.profile = {**candidate.profile, **values}
+    before = {
+        key: candidate.profile.get("phone", candidate.profile.get("mobile"))
+        if key == "mobile"
+        else candidate.profile.get(key)
+        for key in values
+    }
+    candidate.profile = with_contacts(candidate.profile, values)
     candidate.contact_overrides = {**candidate.contact_overrides, **values}
     candidate.contact_revision += 1
     session.add(
@@ -133,6 +138,24 @@ def candidate_read(candidate: Candidate, session: Session | None = None) -> dict
             .order_by(Application.created_at.desc(), Application.id.desc())
         )
         run = session.get(MatchRun, app.latest_match_id) if app and app.latest_match_id else None
+        score = run.score if app and run and run.resume_id == app.current_resume_id else None
+        if app and app.latest_evaluation_id:
+            evaluation = session.get(MatchingEvaluation, app.latest_evaluation_id)
+            if (
+                evaluation
+                and evaluation.resume_id == app.current_resume_id
+                and evaluation.state == "completed"
+            ):
+                roles = select(RoleAssessment).where(RoleAssessment.evaluation_id == evaluation.id)
+                role = session.scalar(
+                    roles.where(
+                        RoleAssessment.opening_id == app.opening_id
+                        if app.status == "shortlisted"
+                        else RoleAssessment.id == evaluation.recommended_assessment_id
+                    )
+                )
+                if role is not None:
+                    score = role.score
         opening = session.get(Opening, app.opening_id) if app else None
         resume = (
             session.get(Resume, app.current_resume_id) if app and app.current_resume_id else None
@@ -142,7 +165,7 @@ def candidate_read(candidate: Candidate, session: Session | None = None) -> dict
             status=app.status if app else "processing",
             opening_id=app.opening_id if app else None,
             opening_title=opening.title if opening else None,
-            score=run.score if app and run and run.resume_id == app.current_resume_id else None,
+            score=score,
             latest_upload_id=resume.upload_id if resume else None,
         )
     return result
@@ -166,9 +189,8 @@ def review_read(row: IdentityReview) -> dict[str, Any]:
 
 
 class CandidateService:
-    def __init__(self, tenants: TenancyService, settings: Settings) -> None:
+    def __init__(self, tenants: TenancyService) -> None:
         self.tenants = tenants
-        self.settings = settings
 
     def list(self, actor: Principal, tenant: UUID, limit: int, offset: int) -> dict[str, Any]:
         with self.tenants.scope(actor, tenant) as session:
@@ -360,27 +382,28 @@ class CandidateService:
                     if not candidate:
                         raise missing()
                 elif action == "create":
-                    profile = dict(extraction.profile)
+                    profile = extraction.profile
+                    available = {}
                     for kind in ("email", "mobile"):
-                        if profile.get(kind) and session.scalar(
-                            select(Contact.id).where(
-                                Contact.kind == kind, Contact.value == profile[kind]
-                            )
+                        field = "phone" if kind == "mobile" and "phone" in profile else kind
+                        value = profile.get(field)
+                        if value and not session.scalar(
+                            select(Contact.id).where(Contact.kind == kind, Contact.value == value)
                         ):
-                            profile[kind] = None
-                    candidate = Candidate(id=uuid4(), tenant_id=tenant, profile=profile)
+                            available[kind] = value
+                    candidate = Candidate(
+                        id=uuid4(),
+                        tenant_id=tenant,
+                        profile=with_contacts(
+                            profile, {kind: available.get(kind) for kind in ("email", "mobile")}
+                        ),
+                    )
                     session.add(candidate)
                     session.flush()
-                    for kind in ("email", "mobile"):
-                        if profile.get(kind):
-                            session.add(
-                                Contact(
-                                    tenant_id=tenant,
-                                    candidate_id=candidate.id,
-                                    kind=kind,
-                                    value=profile[kind],
-                                )
-                            )
+                    session.add_all(
+                        Contact(tenant_id=tenant, candidate_id=candidate.id, kind=kind, value=value)
+                        for kind, value in available.items()
+                    )
                 else:
                     raise AppError(
                         "INVALID_DECISION", "Link a candidate or create a separate candidate.", 422
@@ -392,7 +415,6 @@ class CandidateService:
                     tenant,
                     "cv.uploaded",
                     upload.id,
-                    scoring_strategy=self.settings.scoring_strategy,
                 )
             else:
                 candidate = session.get(Candidate, row.candidate_id) if row.candidate_id else None

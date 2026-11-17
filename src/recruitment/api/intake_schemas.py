@@ -5,7 +5,6 @@ from uuid import UUID
 from pydantic import ConfigDict, Field, SecretStr
 
 from recruitment.api.schemas import Schema
-from recruitment.domain.contracts import CandidateProfile
 
 Provider = Literal["gmail", "microsoft"]
 ConnectionMethod = Literal["imap", "gmail_oauth", "microsoft_oauth"]
@@ -87,7 +86,7 @@ class ContactPatch(Schema):
 
 class CandidateRead(Schema):
     id: UUID
-    profile: CandidateProfile
+    profile: dict[str, Any]
     contact_revision: int
     current_source_at: datetime | None
     contact_history: list[dict[str, Any]] = Field(default_factory=list)

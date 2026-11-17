@@ -1,69 +1,48 @@
-from datetime import date
-
 import pytest
+from pydantic import ValidationError
 
+from recruitment.adapters.fakes import FakeProfiles
 from recruitment.core.errors import ProviderError
-from recruitment.domain.contracts import CandidateProfile, Employment
+from recruitment.domain.contracts import CandidateProfile, JobDescription, MatchResult
+from recruitment.domain.matching import checked_match, masked_profile
 from recruitment.domain.profiles import normalize_profile
 
 
-def profile(employment=None) -> CandidateProfile:
-    return CandidateProfile(
-        name="  Example   Candidate ",
-        email="Person@EXAMPLE.ORG",
-        mobile="+91 98765 43210",
-        language="en",
-        skills=["python", "Python", "postgres"],
-        employment=employment or [],
-        education=[],
-        certifications=[],
-        projects=[],
-        confidence=0.99,
-        location=" Bengaluru   India ",
-    )
+def test_profile_is_strict_and_contact_details_are_masked():
+    profile = FakeProfiles().profile("Example Candidate\nEXAMPLE@example.org\n+91 98765 43210")
+    profile.summary = "Example Candidate at EXAMPLE@example.org, phone +91 98765 43210"
+    profile = normalize_profile(profile)
+    assert profile.email == "example@example.org" and profile.phone == "+919876543210"
+    assert all(masked_profile(profile)[key] == "" for key in ("name", "email", "phone"))
+    assert "Example Candidate" not in masked_profile(profile)["summary"]
+    assert "98765" not in masked_profile(profile)["summary"]
+    invalid = {**profile.model_dump(), "total_experience_years": "4"}
+    with pytest.raises(ValidationError):
+        CandidateProfile.model_validate(invalid)
 
 
-def job(start: str, end: str | None, current: bool = False) -> Employment:
-    return Employment(
-        company="Example",
+def test_match_requires_consistent_experience():
+    job = JobDescription(
         title="Developer",
-        start_month=start,
-        end_month=end,
-        current=current,
-        description="Backend development.",
-        duration_months=999,
+        description="Python development",
+        requirements="",
+        min_experience_years=2,
+        relevant_experience_years=None,
+        domain_experience="",
     )
-
-
-def test_normalizes_contact_location_and_skill_aliases() -> None:
-    result = normalize_profile(profile())
-    assert result.name == "Example Candidate"
-    assert result.email == "person@example.org"
-    assert result.mobile == "+919876543210"
-    assert result.location == "Bengaluru India"
-    assert result.skills == ["PostgreSQL", "Python"]
-    assert result.experience_months is None
-
-
-def test_experience_excludes_overlap_and_ignores_model_arithmetic() -> None:
-    result = normalize_profile(
-        profile(
-            [
-                job("2020-01", "2022-01"),
-                job("2021-01", "2023-01"),
-            ]
-        ),
-        as_of=date(2026, 11, 3),
-    )
-    assert result.experience_months == 36
-    assert [entry.duration_months for entry in result.employment] == [24, 24]
-
-
-def test_current_job_uses_processing_month() -> None:
-    result = normalize_profile(profile([job("2025-11", None, True)]), as_of=date(2026, 11, 3))
-    assert result.experience_months == 12
-
-
-def test_invalid_dates_require_review() -> None:
-    with pytest.raises(ProviderError, match="INVALID_EMPLOYMENT_DATES"):
-        normalize_profile(profile([job("2025-01", "2020-01")]), as_of=date(2026, 11, 3))
+    profile = FakeProfiles().profile("Fictional\n1 year of Python")
+    with pytest.raises(ValidationError):
+        MatchResult(fit=True, score=101, matched=[], missing=[], exp_ok=False, reason="Invalid")
+    with pytest.raises(ProviderError, match="INVALID_MATCH_OUTPUT"):
+        checked_match(
+            job,
+            profile,
+            MatchResult(
+                fit=True,
+                score=100,
+                matched=["Python"],
+                missing=[],
+                exp_ok=False,
+                reason="Invalid",
+            ),
+        )

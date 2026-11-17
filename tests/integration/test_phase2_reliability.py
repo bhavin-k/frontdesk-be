@@ -7,93 +7,19 @@ import psycopg
 import pytest
 from sqlalchemy import func, select
 
-from recruitment.adapters.db.models import (
-    JobCriterion,
-    ResumeChunk,
-)
 from recruitment.adapters.db.phase2 import (
-    EmbeddingBatch,
     MailboxCredential,
     MailboxReceipt,
 )
-from recruitment.adapters.documents import DOCX
 from recruitment.core.errors import ProviderError
 from recruitment.core.time import utcnow
 from recruitment.ports.mailbox import RemoteAttachment, RemoteMessage, Sealed
 from tests.integration.test_mail_intake import connect, fake, new_mail, sync
-from tests.support import docx_bytes, pdf_bytes
+from tests.support import pdf_bytes
 
 
 def contacts(context):
     return context.client.get(f"{context.base}/candidates", headers=context.headers).json()["items"]
-
-
-def test_partial_embedding_batches_survive_worker_restart_without_searchable_partial_vectors(
-    context, monkeypatch
-):
-    context.settings.embedding_batch_size = 1
-    context.settings.embedding_max_parallel_calls = 1
-    cv = docx_bytes(
-        "Example Candidate\ncandidate@example.org\n"
-        + "Python development: Maintained APIs and tested PostgreSQL data migrations.\n" * 38
-    )
-    uploaded = context.upload(cv, DOCX).json()["upload_id"]
-    worker = context.worker()
-    worker.queue.dispatch()
-    lease = worker.queue.claim()
-    assert lease and lease.kind == "cv.uploaded"
-    original = context.providers.embeddings.embed
-    calls = []
-
-    def flaky(texts):
-        calls.append(texts)
-        if len(calls) == 2:
-            raise ProviderError("EMBEDDING_TIMEOUT", retryable=True)
-        return original(texts)
-
-    monkeypatch.setattr(context.providers.embeddings, "embed", flaky)
-    with pytest.raises(ProviderError, match="EMBEDDING_TIMEOUT"):
-        worker.processor.process(lease)
-    with worker.queue.owned(lease) as session:
-        assert session.scalar(select(func.count()).select_from(ResumeChunk)) == 0
-        assert session.scalar(select(func.count()).select_from(EmbeddingBatch)) == 1
-    # A new processor resumes its persisted batch checkpoint, including ordering.
-    context.worker().processor.process(lease)
-    worker.queue.finish(lease)
-    assert len(calls) == 3 and calls[2] == calls[1]
-    assert context.result(uploaded)["criteria"][0]["evidence"]
-    with worker.queue.db.transaction(worker.queue.db.worker, UUID(context.tenant)) as session:
-        assert session.scalar(select(func.count()).select_from(EmbeddingBatch)) == 0
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("embedding_revision", "2"),
-        ("llm_provider", "gateway"),
-        ("llm_base_url", "https://llm.example.invalid/v1"),
-        ("llm_api_format", "chat_completions"),
-        ("profile_model", "custom-profile-model"),
-        ("grader_model", "custom-grading-model"),
-    ],
-)
-def test_configuration_change_during_retry_requires_review(context, cv, field, value):
-    uploaded = context.upload(cv).json()["upload_id"]
-    worker = context.worker()
-    worker.queue.dispatch()
-    lease = worker.queue.claim()
-    assert lease
-    worker.processor._snapshot(lease)
-    setattr(context.settings, field, value)
-    with pytest.raises(ProviderError, match="PROCESSING_CONFIG_CHANGED") as failure:
-        worker.processor.process(lease)
-    worker.queue.fail(lease, failure.value)
-    status = context.client.get(
-        f"{context.base}/cv-uploads/{uploaded}", headers=context.headers
-    ).json()
-    assert status["status"] == "needs_review"
-    assert status["review_reason"] == "PROCESSING_CONFIG_CHANGED"
-    assert contacts(context) == []
 
 
 def test_late_old_cv_cannot_replace_newer_profile_or_match(context, cv):
@@ -102,13 +28,8 @@ def test_late_old_cv_cannot_replace_newer_profile_or_match(context, cv):
     worker.queue.dispatch()
     lease = worker.queue.claim()
     assert lease
-    worker.processor._snapshot(lease)
-    extraction, profile = worker.processor._extract(lease)
-    resume = worker.processor._resolve(lease, profile)
-    with worker.queue.owned(lease) as session:
-        version_id = session.scalar(select(JobCriterion.version_id))
-    assert resume is not None and version_id is not None
-    worker.processor._embed(lease, resume, extraction, profile, [version_id])
+    profile = worker.processor._parse(lease)
+    assert worker.processor._resolve(lease, profile) is not None
     newer = context.upload(
         pdf_bytes(
             "Updated Candidate\ncandidate@example.org\n+919876543210\n"
@@ -123,7 +44,7 @@ def test_late_old_cv_cannot_replace_newer_profile_or_match(context, cv):
         f"{context.base}/applications/{current['application_id']}/match-results",
         headers=context.headers,
     ).json()
-    assert app["result"]["match_run_id"] == current["match_run_id"]
+    assert app["evaluation"]["id"] == current["evaluation_id"]
     assert contacts(context)[0]["profile"]["name"] == "Updated Candidate"
     old_status = context.client.get(
         f"{context.base}/cv-uploads/{older}", headers=context.headers
@@ -214,9 +135,9 @@ def test_identity_conflict_resolution_is_explicit_idempotent_and_preserves_owned
     for item in current:
         if item["id"] in before:
             assert item["profile"]["email"] == before[item["id"]]["profile"]["email"]
-            assert item["profile"]["mobile"] == before[item["id"]]["profile"]["mobile"]
+            assert item["profile"]["phone"] == before[item["id"]]["profile"]["phone"]
         else:
-            assert item["profile"]["email"] is None and item["profile"]["mobile"] is None
+            assert item["profile"]["email"] == "" and item["profile"]["phone"] == ""
     result = context.result(changed)
     assert result["recommendation"] == (
         "needs_review" if decision == "link" else "recommended_shortlist"
@@ -380,9 +301,7 @@ def test_disconnect_fences_inflight_attachment_before_original_is_stored(context
     )
 
 
-def test_retention_removes_mail_metadata_contacts_snapshots_and_pending_embedding_work(
-    context, cv, admin_url
-):
+def test_retention_removes_mail_metadata_contacts_and_converted_documents(context, cv, admin_url):
     from recruitment.adapters.db.models import Candidate, CVUpload, Tombstone
     from recruitment.adapters.db.phase2 import (
         ContactRevision,
@@ -390,7 +309,6 @@ def test_retention_removes_mail_metadata_contacts_snapshots_and_pending_embeddin
         IdentityReview,
         MailAttachment,
         MailMessage,
-        ProcessingSnapshot,
     )
 
     mailbox = connect(context)
@@ -413,16 +331,6 @@ def test_retention_removes_mail_metadata_contacts_snapshots_and_pending_embeddin
     db = context.client.app.state.container.db
     with db.transaction(db.worker, UUID(context.tenant)) as session:
         session.add(
-            EmbeddingBatch(
-                tenant_id=UUID(context.tenant),
-                upload_id=UUID(upload["upload_id"]),
-                position=99,
-                fingerprint="expired-work",
-                input_hash="expired-work",
-                vectors=[],
-            )
-        )
-        session.add(
             DocumentDerivative(
                 tenant_id=UUID(context.tenant),
                 upload_id=UUID(upload["upload_id"]),
@@ -444,8 +352,6 @@ def test_retention_removes_mail_metadata_contacts_snapshots_and_pending_embeddin
             Candidate,
             ContactRevision,
             DocumentDerivative,
-            ProcessingSnapshot,
-            EmbeddingBatch,
             MailMessage,
             MailAttachment,
             IdentityReview,

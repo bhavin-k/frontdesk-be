@@ -18,7 +18,7 @@ def test_legacy_doc_stores_original_and_converted_pdf_with_fake_provenance(conte
     assert uploaded.status_code == 202, uploaded.text
     context.drain()
     result = context.result(uploaded.json()["upload_id"])
-    assert result["criteria"][0]["evidence"]
+    assert result["matched"]
     original = context.client.get(
         f"{context.base}/cv-uploads/{uploaded.json()['upload_id']}/file",
         headers=context.headers,

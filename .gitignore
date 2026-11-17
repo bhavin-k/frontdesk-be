@@ -42,4 +42,8 @@ dist/
 Thumbs.db
 Desktop.ini
 
-docs/
+# Publish the active setup guides. Keep historical local notes out of the backend checkout.
+docs/*
+!docs/ai-configuration.md
+!docs/job-openings.md
+!docs/phase2-operations.md

@@ -1,11 +1,10 @@
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import update
 from sqlalchemy.exc import DBAPIError
 
 from recruitment.adapters.db.models import Application, JobCriterion
-from recruitment.core.errors import ProviderError
 from tests.support import Context, identity, pdf_bytes
 
 
@@ -26,7 +25,8 @@ def test_every_recruiter_can_upload_and_record_decisions(context: Context, cv: b
         f"{context.base}/applications/{result['application_id']}/review-decisions",
         headers={**headers, "Idempotency-Key": str(uuid4())},
         json={
-            "match_run_id": result["match_run_id"],
+            "evaluation_id": result["evaluation_id"],
+            "expected_version": result["expected_version"],
             "decision": "reject",
             "confirm_rejection": True,
             "reason": "The recruiter reviewed the evidence.",
@@ -46,20 +46,6 @@ def test_every_recruiter_can_upload_and_record_decisions(context: Context, cv: b
         )
 
 
-def test_vector_model_mismatch_cannot_be_scored(context: Context, cv: bytes) -> None:
-    context.upload(cv)
-    worker = context.worker()
-    worker.queue.dispatch()
-    lease = worker.queue.claim()
-    assert lease is not None
-    with worker.queue.owned(lease) as session:
-        criterion = session.scalar(select(JobCriterion))
-        assert criterion is not None and criterion.embedding is not None
-        criterion.embedding_model = "another-vector-model"
-    with pytest.raises(ProviderError, match="EMBEDDING_MODEL_MISMATCH"):
-        worker.processor.process(lease)
-
-
 def test_worker_cannot_change_published_criteria(context: Context) -> None:
     db = context.client.app.state.container.db
     with (
@@ -69,7 +55,7 @@ def test_worker_cannot_change_published_criteria(context: Context) -> None:
         session.execute(update(JobCriterion).values(text="Changed by worker"))
 
 
-def test_database_rejects_misattributed_latest_match(context: Context, cv: bytes) -> None:
+def test_database_rejects_misattributed_latest_evaluation(context: Context, cv: bytes) -> None:
     first = context.upload(cv)
     context.drain()
     first_result = context.result(first.json()["upload_id"])
@@ -88,5 +74,5 @@ def test_database_rejects_misattributed_latest_match(context: Context, cv: bytes
         session.execute(
             update(Application)
             .where(Application.id == UUID(second_result["application_id"]))
-            .values(latest_match_id=UUID(first_result["match_run_id"]))
+            .values(latest_evaluation_id=UUID(first_result["evaluation_id"]))
         )

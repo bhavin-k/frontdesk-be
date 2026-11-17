@@ -33,8 +33,6 @@ class OpeningDocument(Owned, Base):
     byte_length: Mapped[int]
     sha256: Mapped[str]
     content: Mapped[bytes] = mapped_column(LargeBinary)
-    extracted_pages: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
-    extraction_method: Mapped[str | None]
 
 
 class OpeningIntakePeriod(Owned, Base):
@@ -54,5 +52,6 @@ class OpeningIntakePeriod(Owned, Base):
         ),
     )
     opening_id: Mapped[UUID]
+    match_description: Mapped[dict[str, Any]] = mapped_column(JSON)
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

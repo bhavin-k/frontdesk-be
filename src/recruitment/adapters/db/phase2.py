@@ -240,36 +240,3 @@ class IdentityReview(Owned, Base):
     reason: Mapped[str | None]
     actor_id: Mapped[UUID | None] = mapped_column(ForeignKey("users.id"))
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-
-
-class ProcessingSnapshot(Owned, Base):
-    __tablename__ = "cv_processing_snapshots"
-    __table_args__ = (
-        UniqueConstraint("upload_id", "scoring_strategy", name="uq_cv_snapshot_strategy"),
-        ForeignKeyConstraint(
-            ["tenant_id", "upload_id"],
-            ["cv_uploads.tenant_id", "cv_uploads.id"],
-            ondelete="CASCADE",
-        ),
-    )
-    upload_id: Mapped[UUID]
-    scoring_strategy: Mapped[str] = mapped_column(server_default="rag")
-    fingerprint: Mapped[str]
-    config: Mapped[dict[str, Any]] = mapped_column(JSON)
-
-
-class EmbeddingBatch(Owned, Base):
-    __tablename__ = "cv_embedding_batches"
-    __table_args__ = (
-        UniqueConstraint("upload_id", "position"),
-        ForeignKeyConstraint(
-            ["tenant_id", "upload_id"],
-            ["cv_uploads.tenant_id", "cv_uploads.id"],
-            ondelete="CASCADE",
-        ),
-    )
-    upload_id: Mapped[UUID]
-    position: Mapped[int]
-    fingerprint: Mapped[str]
-    input_hash: Mapped[str]
-    vectors: Mapped[list[list[float]]] = mapped_column(JSON)

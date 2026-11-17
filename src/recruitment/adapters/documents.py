@@ -4,26 +4,42 @@ import struct
 import zipfile
 
 import olefile
-import pymupdf
 from docx import Document
+from PIL import Image
 
 from recruitment.adapters.pdf_safety import validate_pdf
 from recruitment.core.errors import AppError, ProviderError
-from recruitment.domain.contracts import Extraction, Page
 
 PDF = "application/pdf"
 DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 DOC = "application/msword"
+JPEG = "image/jpeg"
+PNG = "image/png"
+IMAGE_FORMATS = {JPEG: "JPEG", PNG: "PNG"}
+WORD_TYPES = {DOC, DOCX}
+DOCUMENT_TYPES = {PDF, *WORD_TYPES}
+CV_TYPES = DOCUMENT_TYPES | IMAGE_FORMATS.keys()
+MAX_IMAGE_PIXELS = 16_000_000
 MAX_BYTES = 10 * 1024 * 1024
 
 
 def validate_file(content: bytes, mime_type: str, max_bytes: int = MAX_BYTES) -> None:
     if not content or len(content) > max_bytes:
         raise AppError("FILE_SIZE", "Upload a nonempty file no larger than 10 MB.", 413)
-    if mime_type not in {PDF, DOCX, DOC}:
-        raise AppError("UNSUPPORTED_FILE", "Upload a PDF, DOCX or DOC file.", 415)
+    if mime_type not in CV_TYPES:
+        raise AppError("UNSUPPORTED_FILE", "Upload a PDF, DOCX, DOC, JPEG or PNG file.", 415)
     try:
-        if mime_type == PDF:
+        if mime_type in IMAGE_FORMATS:
+            with Image.open(io.BytesIO(content), formats=[IMAGE_FORMATS[mime_type]]) as image:
+                if (
+                    image.width * image.height > MAX_IMAGE_PIXELS
+                    or getattr(image, "n_frames", 1) != 1
+                ):
+                    raise ValueError
+                image.verify()
+            with Image.open(io.BytesIO(content), formats=[IMAGE_FORMATS[mime_type]]) as image:
+                image.load()
+        elif mime_type == PDF:
             validate_pdf(content)
         elif mime_type == DOC:
             with olefile.OleFileIO(
@@ -61,31 +77,6 @@ def validate_file(content: bytes, mime_type: str, max_bytes: int = MAX_BYTES) ->
         ) from exc
 
 
-class LocalExtractor:
-    def extract(self, content: bytes, mime_type: str) -> Extraction:
-        try:
-            if mime_type == PDF:
-                with pymupdf.open(stream=content, filetype="pdf") as doc:  # type: ignore[no-untyped-call]
-                    pages = [Page(number=i + 1, text=page.get_text()) for i, page in enumerate(doc)]
-                return Extraction(pages=pages, method="pymupdf")
-            doc = Document(io.BytesIO(content))
-            from docx.table import Table
-            from docx.text.paragraph import Paragraph
-
-            parts = []
-            for element in doc.iter_inner_content():
-                if isinstance(element, Paragraph):
-                    parts.append(element.text)
-                elif isinstance(element, Table):
-                    parts.extend(
-                        " | ".join(cell.text for cell in row.cells) for row in element.rows
-                    )
-            text = "\n".join(parts)
-            return Extraction(pages=[Page(number=None, text=text)], method="python-docx")
-        except Exception as exc:
-            raise ProviderError("EXTRACTION_FAILED") from exc
-
-
 class ClamAVScanner:
     def __init__(self, host: str, port: int) -> None:
         self.host, self.port = host, port
@@ -112,9 +103,3 @@ class ClamAVScanner:
                 raise ProviderError("SCANNER_UNAVAILABLE", retryable=True)
         except OSError as exc:
             raise ProviderError("SCANNER_UNAVAILABLE", retryable=True) from exc
-
-
-def needs_ocr(extraction: Extraction) -> bool:
-    return not extraction.pages or any(
-        sum(character.isalnum() for character in page.text) < 20 for page in extraction.pages
-    )

@@ -139,13 +139,6 @@ def opening_action(
     return services.openings.action(actor, tenant_id, opening_id, payload)
 
 
-@router.post("/openings/{opening_id}/criteria/retry", response_model=OpeningRead, status_code=202)
-def retry_criteria(
-    tenant_id: UUID, opening_id: UUID, payload: RevisionRequest, actor: Actor, services: Services
-) -> dict[str, Any]:
-    return services.openings.retry(actor, tenant_id, opening_id, payload.expected_revision)
-
-
 @router.get("/openings/{opening_id}/documents")
 def list_documents(
     tenant_id: UUID, opening_id: UUID, actor: Actor, services: Services

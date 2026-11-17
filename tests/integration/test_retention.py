@@ -28,7 +28,8 @@ def test_confirmed_rejection_deletes_personal_content_and_keeps_only_tombstone(
         f"{context.base}/applications/{result['application_id']}/review-decisions",
         headers={**context.headers, "Idempotency-Key": str(uuid4())},
         json={
-            "match_run_id": result["match_run_id"],
+            "evaluation_id": result["evaluation_id"],
+            "expected_version": result["expected_version"],
             "decision": "reject",
             "confirm_rejection": True,
             "reason": "Recruiter confirmed the rejection.",
@@ -47,7 +48,6 @@ def test_confirmed_rejection_deletes_personal_content_and_keeps_only_tombstone(
             "resumes",
             "cv_uploads",
             "resume_extractions",
-            "resume_chunks",
             "match_runs",
             "criterion_results",
             "review_decisions",
@@ -153,7 +153,8 @@ def test_deletion_keeps_shared_identity_for_unexpired_reapplication(
         f"{context.base}/applications/{old_result['application_id']}/review-decisions",
         headers={**context.headers, "Idempotency-Key": str(uuid4())},
         json={
-            "match_run_id": old_result["match_run_id"],
+            "evaluation_id": old_result["evaluation_id"],
+            "expected_version": old_result["expected_version"],
             "decision": "reject",
             "confirm_rejection": True,
             "reason": "Confirmed initial rejection.",

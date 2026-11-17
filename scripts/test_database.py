@@ -13,7 +13,10 @@ from urllib.parse import quote
 import psycopg
 
 ROOT = Path(__file__).resolve().parents[1]
-IMAGE = "pgvector/pgvector@sha256:0dd3149a06e4579a0d70d8fef9945636cd514005e7237deb27f9b67886f8dc4f"
+IMAGE = (
+    "postgres:16.15-bookworm@"
+    "sha256:5264710be20f409750ac6dc4e5706dcef929c87e241605463f0f9aefa932a8d9"
+)
 PROJECT = hashlib.sha256(str(ROOT).encode()).hexdigest()[:10]
 NAME = f"recruitment-phase1-test-{PROJECT}"
 STATE = ROOT / ".local" / "test-database.json"
@@ -48,8 +51,6 @@ def start() -> None:
         "--detach",
         "--name",
         NAME,
-        "--pull",
-        "never",
         "--label",
         f"recruitment.project={PROJECT}",
         "--label",

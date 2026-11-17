@@ -3,7 +3,6 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
-from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     JSON,
     DateTime,
@@ -94,9 +93,6 @@ class Opening(Owned, Base):
     questions: Mapped[list[str]] = mapped_column(JSON, default=list)
     revision: Mapped[int] = mapped_column(default=1)
     source_revision: Mapped[int] = mapped_column(default=1)
-    criteria_status: Mapped[str] = mapped_column(default="queued")
-    criteria_error: Mapped[str | None]
-    preparation_config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
 class CriteriaVersion(Owned, Base):
@@ -136,9 +132,6 @@ class JobCriterion(Owned, Base):
     strict: Mapped[bool]
     weight: Mapped[Decimal] = mapped_column(Numeric(8, 3))
     source_evidence: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
-    embedding: Mapped[Any | None] = mapped_column(Vector(1536), nullable=True)
-    embedding_model: Mapped[str | None]
-    embedding_fingerprint: Mapped[str | None]
 
 
 class Candidate(Owned, Base):
@@ -267,6 +260,9 @@ class CVUpload(Owned, Base):
     )
     file_id: Mapped[UUID]
     opening_id: Mapped[UUID]
+    matching_openings: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, default=list, server_default="[]"
+    )
     application_id: Mapped[UUID | None]
     status: Mapped[str] = mapped_column(default="queued")
     review_reason: Mapped[str | None]
@@ -318,40 +314,6 @@ class ResumeExtraction(Owned, Base):
     prompt_version: Mapped[str]
 
 
-class ResumeChunk(Owned, Base):
-    __tablename__ = "resume_chunks"
-    __table_args__ = (
-        UniqueConstraint("tenant_id", "id"),
-        UniqueConstraint("resume_id", "position"),
-        Index("ix_chunks_resume", "tenant_id", "resume_id"),
-        Index(
-            "ix_chunk_vector",
-            "embedding",
-            postgresql_using="hnsw",
-            postgresql_with={"m": 16, "ef_construction": 64},
-            postgresql_ops={"embedding": "vector_cosine_ops"},
-        ),
-        ForeignKeyConstraint(
-            ["tenant_id", "resume_id"],
-            ["resumes.tenant_id", "resumes.id"],
-            ondelete="CASCADE",
-        ),
-    )
-    resume_id: Mapped[UUID]
-    position: Mapped[int]
-    source_spans: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
-    text: Mapped[str] = mapped_column(Text)
-    scoring_text: Mapped[str] = mapped_column(Text)
-    token_start: Mapped[int]
-    token_end: Mapped[int]
-    embedding: Mapped[Any] = mapped_column(Vector(1536))
-    embedding_model: Mapped[str]
-    embedding_dimensions: Mapped[int] = mapped_column(default=1536)
-    embedding_fingerprint: Mapped[str] = mapped_column(
-        default="legacy-unfingerprinted", server_default="legacy-unfingerprinted"
-    )
-
-
 class MatchRun(Owned, Base):
     __tablename__ = "match_runs"
     __table_args__ = (
@@ -384,13 +346,6 @@ class MatchRun(Owned, Base):
     model: Mapped[str]
     provider: Mapped[str]
     prompt_version: Mapped[str]
-    scoring_strategy: Mapped[str] = mapped_column(server_default="rag")
-    embedding_model: Mapped[str | None]
-    embedding_dimensions: Mapped[int | None]
-    embedding_fingerprint: Mapped[str | None]
-    processing_config: Mapped[dict[str, Any]] = mapped_column(
-        JSON, default=dict, server_default="{}"
-    )
     policy_version: Mapped[str] = mapped_column(default="legacy-v1", server_default="legacy-v1")
     missing_required_criteria: Mapped[list[str]] = mapped_column(JSON)
     processed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -415,7 +370,6 @@ class CriterionResult(Owned, Base):
     status: Mapped[str]
     confidence: Mapped[Decimal] = mapped_column(Numeric(5, 4))
     reason: Mapped[str] = mapped_column(Text)
-    evidence: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
 
 
 class ReviewDecision(Owned, Base):
@@ -469,7 +423,6 @@ class Outbox(Owned, Base):
         Index("ix_outbox_pending", "available_at", postgresql_where=text("dispatched_at IS NULL")),
     )
     kind: Mapped[str]
-    scoring_strategy: Mapped[str] = mapped_column(server_default="rag")
     aggregate_id: Mapped[UUID]
     dedupe_key: Mapped[str] = mapped_column(unique=True)
     available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -488,7 +441,6 @@ class Job(Owned, Base):
         ),
     )
     kind: Mapped[str]
-    scoring_strategy: Mapped[str] = mapped_column(server_default="rag")
     aggregate_id: Mapped[UUID]
     dedupe_key: Mapped[str] = mapped_column(unique=True)
     state: Mapped[str] = mapped_column(default="queued")
