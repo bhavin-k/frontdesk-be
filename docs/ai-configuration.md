@@ -25,7 +25,11 @@ Set `RECRUITMENT_PROVIDER_MODE=real` and configure `RECRUITMENT_LLM_API_KEY`, `R
 
 Set `RECRUITMENT_PROFILE_MODEL` for CV parsing and `RECRUITMENT_GRADER_MODEL` for matching. The default API format selects Responses for OpenAI and Chat Completions for other endpoints. Use `json_schema` for structured output where available. Chat Completions also supports `json_object` and `text`. The backend validates both outputs locally in every mode.
 
+Set `RECRUITMENT_PROFILE_CHAT_DISABLE_THINKING=true` to disable thinking for CV parsing on Chat Completions endpoints that support the `thinking` field. Set it to `false` when switching to an endpoint that does not support the field.
+
 `RECRUITMENT_CV_TOKEN_CEILING` limits extracted CV text and defaults to 20,000. `RECRUITMENT_LLM_REQUEST_TOKENS` and `RECRUITMENT_LLM_OUTPUT_TOKENS` default to 32,768 and 3,072. Set them within the provider's limits. Unreadable files and invalid or exhausted model responses appear in recruiter review.
+
+The worker logs provider-reported input, output and total tokens for each CV parser and JD matcher response that includes usage. Add the parser total and one matcher total per opening to get the usage for a CV. Include any extra responses from retries.
 
 ## Upgrade an existing database
 

@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     # Compatibility with existing installations; never use this at a custom endpoint.
     openai_api_key: SecretStr | None = None
     profile_model: str = Field(default="gpt-6-luna", min_length=1, max_length=200, pattern=r"\S")
+    profile_chat_disable_thinking: bool = False
     grader_model: str = Field(default="gpt-6.1-terra", min_length=1, max_length=200, pattern=r"\S")
     mailbox_provider_mode: Literal["real", "fake"] = "fake"
     enabled_mailbox_methods: str = "gmail_oauth,microsoft_oauth"

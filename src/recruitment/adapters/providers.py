@@ -18,7 +18,7 @@ from recruitment.ports.providers import (
     MalwareScanner,
 )
 
-PARSER_PROMPT = "cv-parser-v1"
+PARSER_PROMPT = "cv-parser-v2"
 MATCHER_PROMPT = "jd-matcher-v1"
 
 
@@ -69,6 +69,7 @@ class Providers:
                 settings.llm_output_mode,
                 request_tokens=settings.llm_request_tokens,
                 output_tokens=settings.llm_output_tokens,
+                chat_disable_thinking=settings.profile_chat_disable_thinking,
             ),
             JDMatcher(
                 client,

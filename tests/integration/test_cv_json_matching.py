@@ -147,6 +147,11 @@ def test_retry_reuses_profile_and_completed_opening_results(context, cv, admin_u
     upload = context.upload(cv).json()["upload_id"]
     assert context.worker().run_once()
     with psycopg.connect(admin_url) as db:
+        # Keep using profiles saved before the compact parser prompt was deployed.
+        db.execute(
+            "UPDATE resume_extractions SET prompt_version='cv-parser-v1' WHERE upload_id=%s",
+            (upload,),
+        )
         db.execute("UPDATE job_runs SET available_at=now() WHERE state='retry_wait'")
     context.drain()
     assert len(parses) == 1

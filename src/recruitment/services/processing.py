@@ -46,7 +46,7 @@ class CVProcessor:
             cached = session.scalar(
                 select(ResumeExtraction).where(ResumeExtraction.upload_id == upload.id)
             )
-            if cached and cached.prompt_version == PARSER_PROMPT:
+            if cached and cached.prompt_version in {"cv-parser-v1", PARSER_PROMPT}:
                 return CandidateProfile.model_validate(cached.profile)
             file = session.get(ResumeFile, upload.file_id)
             assert file is not None

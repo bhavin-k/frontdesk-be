@@ -61,10 +61,12 @@ class StructuredAI:
         *,
         request_tokens: int = 32_768,
         output_tokens: int = 3072,
+        chat_disable_thinking: bool = False,
     ) -> None:
         self.client, self.model, self.prompt = client, model, prompt
         self.api_format, self.output_mode = api_format, output_mode
         self.request_tokens, self.output_tokens = request_tokens, output_tokens
+        self.chat_extra_body = {"thinking": {"type": "disabled"}} if chat_disable_thinking else None
 
     def prompt_text(self, extra_instructions: str) -> str:
         return (
@@ -75,9 +77,12 @@ class StructuredAI:
     def _chat_instructions(self, prompt: str, schema: type[BaseModel]) -> str:
         if self.output_mode == "json_schema" and not self.inline_chat_schema:
             return f"{prompt}\nReturn one JSON object matching the response schema."
+        schema_json = json.dumps(
+            schema.model_json_schema(), ensure_ascii=False, separators=(",", ":")
+        )
         return (
             f"{prompt}\nReturn one JSON object matching this schema. No Markdown or extra text.\n"
-            f"{json.dumps(schema.model_json_schema())}"
+            f"{schema_json}"
         )
 
     def estimate_input_tokens(
@@ -181,6 +186,7 @@ class StructuredAI:
                 temperature=temperature,
                 response_format=schema,
                 max_completion_tokens=output_tokens if output_tokens is not None else omit,
+                extra_body=self.chat_extra_body,
             )
             self._observe_chat_usage(completion.usage, observe_usage)
             if (
@@ -198,14 +204,35 @@ class StructuredAI:
             temperature=temperature,
             response_format={"type": "json_object"} if self.output_mode == "json_object" else omit,
             max_completion_tokens=output_tokens if output_tokens is not None else omit,
+            extra_body=self.chat_extra_body,
         )
         self._observe_chat_usage(response.usage, observe_usage)
-        if not response.choices:
-            raise ProviderError("MODEL_OUTPUT_UNAVAILABLE")
-        choice = response.choices[0]
-        if choice.finish_reason != "stop" or choice.message.refusal or not choice.message.content:
-            raise ProviderError("MODEL_OUTPUT_UNAVAILABLE")
-        return schema.model_validate_json(choice.message.content)
+        reason = "no_choices"
+        if response.choices:
+            choice = response.choices[0]
+            if choice.message.refusal:
+                reason = "refusal"
+            elif choice.finish_reason == "stop":
+                if choice.message.content:
+                    return schema.model_validate_json(choice.message.content)
+                reason = "empty_content"
+            elif choice.finish_reason in {
+                "length",
+                "content_filter",
+                "tool_calls",
+                "function_call",
+            }:
+                reason = choice.finish_reason
+            else:
+                reason = "unknown_finish_reason"
+        logger.warning(
+            "ai.output_unavailable prompt=%s reason=%s output_tokens=%s limit=%s",
+            self.prompt,
+            reason,
+            response.usage.completion_tokens if response.usage is not None else None,
+            output_tokens,
+        )
+        raise ProviderError("MODEL_OUTPUT_UNAVAILABLE")
 
     @staticmethod
     def _observe_chat_usage(
@@ -225,7 +252,18 @@ class StructuredAI:
         if self.estimate_input_tokens(value, schema, "") + self.output_tokens > self.request_tokens:
             raise ProviderError("LLM_INPUT_TOO_LARGE")
         return request_with_rate_limit_retries(
-            lambda: self.parse(value, schema, output_tokens=self.output_tokens)
+            lambda: self.parse(
+                value, schema, output_tokens=self.output_tokens, observe_usage=self._log_usage
+            )
+        )
+
+    def _log_usage(self, usage: TokenUsage) -> None:
+        logger.info(
+            "ai.token_usage prompt=%s input_tokens=%s output_tokens=%s total_tokens=%s",
+            self.prompt,
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.input_tokens + usage.output_tokens,
         )
 
 
@@ -236,5 +274,14 @@ class CVParser(StructuredAI):
 
 class JDMatcher(StructuredAI):
     def match(self, job: JobDescription, profile: dict[str, Any]) -> MatchResult:
-        value = json.dumps({"job": job.model_dump(), "cv": profile})
+        cv = {
+            key: value
+            for key, value in profile.items()
+            if key not in {"name", "email", "phone"} and value not in ("", [], None)
+        }
+        value = json.dumps(
+            {"job": job.model_dump(exclude_none=True), "cv": cv},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         return self.bounded_parse(value, MatchResult)
