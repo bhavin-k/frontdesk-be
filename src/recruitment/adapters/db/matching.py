@@ -11,6 +11,15 @@ from sqlalchemy.orm import Mapped, mapped_column
 from recruitment.adapters.db.models import Base, Owned
 
 
+class JobScoringRubric(Owned, Base):
+    __tablename__ = "job_scoring_rubrics"
+    __table_args__ = (UniqueConstraint("tenant_id", "signature"),)
+    signature: Mapped[str]
+    content: Mapped[dict[str, Any]] = mapped_column(JSON)
+    model: Mapped[str]
+    prompt_version: Mapped[str]
+
+
 class MatchingEvaluation(Owned, Base):
     __tablename__ = "matching_evaluations"
     __table_args__ = (

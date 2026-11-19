@@ -1,5 +1,7 @@
 from pydantic import BaseModel, ConfigDict, Field
 
+from recruitment.domain.scoring_contracts import ScoreBreakdown, ScoringRubric
+
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -37,6 +39,7 @@ class JobDescription(StrictAIModel):
     min_experience_years: float = Field(ge=0, le=80)
     relevant_experience_years: float | None = Field(ge=0, le=80)
     domain_experience: str
+    rubric: ScoringRubric | None = None
 
 
 class MatchResult(StrictAIModel):
@@ -46,6 +49,13 @@ class MatchResult(StrictAIModel):
     missing: list[str] = Field(max_length=50)
     exp_ok: bool
     reason: str = Field(min_length=1, max_length=2000)
+    score_breakdown: ScoreBreakdown | None = None
+
+
+class BriefMatchResult(MatchResult):
+    matched: list[str] = Field(max_length=5)
+    missing: list[str] = Field(max_length=5)
+    reason: str = Field(min_length=1, max_length=600)
 
 
 class Page(StrictModel):

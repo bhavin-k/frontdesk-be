@@ -13,6 +13,7 @@ from recruitment.services.mailboxes import MailboxService
 from recruitment.services.openings import OpeningService
 from recruitment.services.overview import OverviewService
 from recruitment.services.recruitment import RecruitmentService
+from recruitment.services.screening_dashboard import ScreeningDashboard
 from recruitment.services.tenancy import TenancyService
 
 
@@ -27,6 +28,7 @@ class Container:
     notifications: MailNotifications
     overview: OverviewService
     openings: OpeningService
+    screening: ScreeningDashboard
 
 
 def container(request: Request) -> Container:
@@ -37,13 +39,19 @@ Services = Annotated[Container, Depends(container)]
 bearer = HTTPBearer(auto_error=False)
 
 
-def principal(
-    services: Services,
+def session_token(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
-) -> Principal:
+) -> str:
     if not credentials:
         raise AppError("UNAUTHENTICATED", "Sign in to continue.", 401)
-    return services.auth.authenticate(credentials.credentials)
+    return credentials.credentials
+
+
+SessionToken = Annotated[str, Depends(session_token)]
+
+
+def principal(services: Services, token: SessionToken) -> Principal:
+    return services.auth.authenticate(token)
 
 
 Actor = Annotated[Principal, Depends(principal)]

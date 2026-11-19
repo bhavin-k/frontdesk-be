@@ -14,6 +14,13 @@ from recruitment.domain.contracts import (
     MatchResult,
     Page,
 )
+from recruitment.domain.scoring import calculate_match
+from recruitment.domain.scoring_contracts import (
+    ChecklistDraft,
+    CriterionGrade,
+    Evidence,
+    EvidenceGrades,
+)
 
 
 class FakeScanner:
@@ -76,6 +83,29 @@ class FakeMatcher:
     model = "fake-matcher-v1"
 
     def match(self, job: JobDescription, profile: dict[str, Any]) -> MatchResult:
+        if job.rubric is not None:
+            grades = []
+            for criterion in job.rubric.criteria:
+                source = next(
+                    (
+                        (index, skill)
+                        for index, skill in enumerate(profile["skills"])
+                        if skill.casefold() == criterion.label.casefold()
+                    ),
+                    None,
+                )
+                grades.append(
+                    CriterionGrade(
+                        id=criterion.id,
+                        status="met" if source else "undocumented",
+                        evidence=Evidence(path=f"skills/{source[0]}", quote=source[1])
+                        if source
+                        else None,
+                    )
+                )
+            return calculate_match(
+                job, profile, EvidenceGrades(grades=grades, additional_skills=[])
+            )
         requirements = job.description + "\n" + job.requirements
         known = ("Python", "PostgreSQL", "SQL", "JavaScript", "Excel")
         expected = [name for name in known if re.search(rf"\b{name}\b", requirements, re.I)]
@@ -90,3 +120,16 @@ class FakeMatcher:
             exp_ok=exp_ok,
             reason="Development result from the fictional CV provider.",
         )
+
+
+class FakeChecklistBuilder:
+    model = "fake-checklist-v1"
+
+    def prepare(self, job: JobDescription) -> ChecklistDraft:
+        text = job.description + "\n" + job.requirements
+        labels = [
+            name
+            for name in ("Python", "PostgreSQL", "SQL", "JavaScript", "Excel")
+            if re.search(rf"\b{name}\b", text, re.I)
+        ]
+        return ChecklistDraft(required=labels or [job.title], preferred=[])

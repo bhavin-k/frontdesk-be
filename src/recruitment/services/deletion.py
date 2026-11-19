@@ -19,6 +19,7 @@ from recruitment.adapters.db.models import (
     Tombstone,
 )
 from recruitment.adapters.db.phase2 import IdentityReview, MailAttachment, MailMessage
+from recruitment.adapters.db.screening import ScreeningMessage, ScreeningRequest, ScreeningThread
 from recruitment.core.time import utcnow
 from recruitment.domain.retention import deadline
 from recruitment.ports.queue import Lease, WorkerQueue
@@ -102,6 +103,25 @@ class RetentionService:
             ids.extend(session.scalars(select(Resume.id).where(Resume.application_id == app.id)))
             ids.extend(
                 session.scalars(select(MatchRun.id).where(MatchRun.application_id == app.id))
+            )
+            screenings = list(
+                session.scalars(
+                    select(ScreeningRequest.id).where(
+                        ScreeningRequest.application_id == app.id,
+                    )
+                )
+            )
+            ids.extend(screenings)
+            ids.extend(
+                session.scalars(
+                    select(ScreeningMessage.id).where(
+                        ScreeningMessage.thread_id.in_(
+                            select(ScreeningThread.id).where(
+                                ScreeningThread.request_id.in_(screenings),
+                            )
+                        ),
+                    )
+                )
             )
             candidate_id = app.candidate_id
             session.add(

@@ -2,6 +2,7 @@ import base64
 import json
 from typing import Literal
 from urllib.parse import urlsplit
+from uuid import UUID
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
@@ -51,6 +52,7 @@ class Settings(BaseSettings):
     profile_model: str = Field(default="gpt-6-luna", min_length=1, max_length=200, pattern=r"\S")
     profile_chat_disable_thinking: bool = False
     grader_model: str = Field(default="gpt-6.1-terra", min_length=1, max_length=200, pattern=r"\S")
+    grader_chat_disable_thinking: bool = False
     mailbox_provider_mode: Literal["real", "fake"] = "fake"
     enabled_mailbox_methods: str = "gmail_oauth,microsoft_oauth"
     imap_poll_seconds: int = Field(default=60, ge=30, le=900)
@@ -78,6 +80,14 @@ class Settings(BaseSettings):
     lease_seconds: int = 300
     max_job_attempts: int = 3
     worker_poll_seconds: float = 1.0
+    screening_test_tenant_id: UUID | None = None
+    screening_availability_file: str = ".local/screening-availability.json"
+    screening_email_limit_per_hour: int = Field(default=30, ge=1, le=100)
+
+    @field_validator("screening_test_tenant_id", mode="before")
+    @classmethod
+    def empty_pilot_is_disabled(cls, value: object) -> object:
+        return None if isinstance(value, str) and not value.strip() else value
 
     @field_validator("llm_provider")
     @classmethod

@@ -1,6 +1,7 @@
 from typing import Any, Protocol
 
 from recruitment.domain.contracts import CandidateProfile, Extraction, JobDescription, MatchResult
+from recruitment.domain.scoring_contracts import ChecklistDraft
 
 
 class FileStorage(Protocol):
@@ -32,3 +33,9 @@ class JobMatcher(Protocol):
     model: str
 
     def match(self, job: JobDescription, profile: dict[str, Any]) -> MatchResult: ...
+
+
+class ChecklistBuilder(Protocol):
+    model: str
+
+    def prepare(self, job: JobDescription) -> ChecklistDraft: ...

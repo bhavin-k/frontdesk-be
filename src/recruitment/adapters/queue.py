@@ -2,6 +2,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import timedelta
 from secrets import randbelow
+from uuid import UUID
 
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
@@ -34,14 +35,24 @@ class PostgresJobQueue:
             if self.settings.auto_delete_enabled:
                 session.execute(text("SELECT schedule_retention()"))
                 session.execute(text("SELECT schedule_mail_retention()"))
+            if self.settings.screening_test_tenant_id is not None:
+                session.execute(
+                    text("SELECT schedule_screening_poll(:tenant)"),
+                    {"tenant": self.settings.screening_test_tenant_id},
+                )
             return int(session.scalar(text("SELECT dispatch_outbox()")) or 0)
 
     def claim(self) -> Lease | None:
         with self.db.transaction(self.db.dispatcher) as session:
             row = (
                 session.execute(
-                    text("SELECT * FROM claim_job(:seconds)"),
-                    {"seconds": self.settings.lease_seconds},
+                    text("SELECT * FROM claim_pilot_job(:seconds, CAST(:pilot AS uuid))")
+                    if self.settings.screening_test_tenant_id
+                    else text("SELECT * FROM claim_job(:seconds)"),
+                    {
+                        "seconds": self.settings.lease_seconds,
+                        "pilot": self.settings.screening_test_tenant_id,
+                    },
                 )
                 .mappings()
                 .first()
@@ -82,10 +93,21 @@ class PostgresJobQueue:
             )
 
     @contextmanager
+    def rubric_scope(self, lease: Lease) -> Iterator[Session]:
+        with self.db.transaction(self.db.worker, lease.tenant_id) as session:
+            yield session
+
+    @contextmanager
     def serialize_cv_scoring(self, lease: Lease) -> Iterator[None]:
         # A separate connection lets the worker heartbeat and retention proceed.
         with self.db.transaction(self.db.worker, lease.tenant_id) as session:
             advisory_lock(session, f"cv-scoring:{lease.tenant_id}:{lease.aggregate_id}")
+            yield
+
+    @contextmanager
+    def serialize_screening(self, lease: Lease, request_id: UUID) -> Iterator[None]:
+        with self.db.transaction(self.db.worker, lease.tenant_id) as session:
+            advisory_lock(session, f"screening:{lease.tenant_id}:{request_id}")
             yield
 
     def finish(self, lease: Lease) -> None:

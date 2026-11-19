@@ -10,17 +10,26 @@ from recruitment.ports.queue import Lease, LeaseLost, WorkerQueue
 from recruitment.services.deletion import RetentionService
 from recruitment.services.mail_intake import MailboxJobs
 from recruitment.services.processing import CVProcessor
+from recruitment.services.screening import ScreeningJobs
 
 logger = logging.getLogger(__name__)
 
 
 class Worker:
-    def __init__(self, queue: WorkerQueue, providers: Providers) -> None:
+    def __init__(
+        self,
+        queue: WorkerQueue,
+        providers: Providers,
+        screening: ScreeningJobs | None = None,
+    ) -> None:
         self.queue = queue
         self.processor = CVProcessor(queue, providers)
         self.retention = RetentionService(queue)
         providers.mailboxes = providers.mailboxes or MailboxRuntime(queue.settings)
         self.mailboxes = MailboxJobs(queue, providers, providers.mailboxes)
+        self.screening = screening or ScreeningJobs.configured(
+            queue, providers.mailboxes, providers.client
+        )
 
     @contextmanager
     def heartbeat(self, lease: Lease) -> Iterator[None]:
@@ -71,6 +80,8 @@ class Worker:
                     self.mailboxes.disconnect(lease)
                 elif lease.kind == "mail.attachment":
                     self.mailboxes.attachment(lease)
+                elif lease.kind.startswith("screening.") and self.screening:
+                    self.screening.run(lease)
                 else:
                     raise ProviderError("UNKNOWN_JOB")
                 self.queue.finish(lease)
@@ -82,5 +93,7 @@ class Worker:
                 "job.failed job_id=%s code=%s type=%s", lease.id, error.code, type(exc).__name__
             )
             with suppress(LeaseLost):
+                if lease.kind.startswith("screening.") and self.screening:
+                    self.screening.failed(lease, error)
                 self.queue.fail(lease, error)
         return True

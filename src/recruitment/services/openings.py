@@ -7,7 +7,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import ColumnElement, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from recruitment.adapters.db.models import Opening
 from recruitment.adapters.db.openings import OpeningDocument, OpeningIntakePeriod
@@ -21,8 +21,10 @@ from recruitment.domain.openings import (
     OpeningCreate,
     OpeningUpdate,
 )
+from recruitment.domain.scoring_contracts import POLICY_VERSION
 from recruitment.services.auth import Principal
 from recruitment.services.common import advisory_lock, existing_request, missing, remember_request
+from recruitment.services.scoring_rubrics import prepare_rubric, saved_rubric
 from recruitment.services.tenancy import TenancyService
 
 MAX_DOCUMENTS = 5
@@ -47,7 +49,11 @@ def open_at(received_at: datetime) -> ColumnElement[bool]:
 
 def openings_at(session: Session, received_at: datetime) -> list[dict[str, Any]]:
     return [
-        {"opening_id": str(period.opening_id), "jd": period.match_description}
+        {
+            "opening_id": str(period.opening_id),
+            "jd": period.match_description,
+            "scoring_policy": POLICY_VERSION,
+        }
         for period in session.scalars(
             select(OpeningIntakePeriod)
             .where(open_at(received_at))
@@ -69,15 +75,20 @@ def intake_allowed(session: Session, opening: Opening, received_at: datetime | N
     )
 
 
-def start_period(session: Session, opening: Opening, starts_at: datetime) -> None:
-    jd = JobDescription(
-        title=opening.title,
-        description=opening.job_description,
-        requirements=opening.details.get("candidate_requirements") or "",
-        min_experience_years=opening.details.get("total_experience_years") or 0,
-        relevant_experience_years=opening.details.get("relevant_experience_years"),
-        domain_experience=opening.details.get("domain_experience") or "",
+def job_description(title: str, description: str, details: dict[str, Any]) -> JobDescription:
+    return JobDescription(
+        title=title,
+        description=description,
+        requirements=details.get("candidate_requirements") or "",
+        min_experience_years=details.get("total_experience_years") or 0,
+        relevant_experience_years=details.get("relevant_experience_years"),
+        domain_experience=details.get("domain_experience") or "",
     )
+
+
+def start_period(session: Session, opening: Opening, starts_at: datetime) -> None:
+    jd = job_description(opening.title, opening.job_description, opening.details)
+    jd.rubric = saved_rubric(session, jd)
     session.add(
         OpeningIntakePeriod(
             tenant_id=opening.tenant_id,
@@ -134,6 +145,10 @@ class OpeningService:
             .where(OpeningDocument.opening_id == row.id)
             .order_by(OpeningDocument.created_at, OpeningDocument.id)
         )
+        return OpeningService.opening_read(row, list(documents))
+
+    @staticmethod
+    def opening_read(row: Opening, documents: list[OpeningDocument]) -> dict[str, Any]:
         return {
             "id": row.id,
             "title": row.title,
@@ -154,14 +169,36 @@ class OpeningService:
         self, actor: Principal, tenant: UUID, limit: int, offset: int, status: str | None
     ) -> dict[str, Any]:
         with self.tenants.scope(actor, tenant) as session:
-            query = select(Opening.id)
+            query = select(Opening)
             if status:
                 query = query.where(Opening.status == status)
-            ids = session.scalars(
-                query.order_by(Opening.created_at.desc(), Opening.id).offset(offset).limit(limit)
+            rows = list(
+                session.scalars(
+                    query.order_by(Opening.created_at.desc(), Opening.id)
+                    .offset(offset)
+                    .limit(limit)
+                )
             )
+            documents: dict[UUID, list[OpeningDocument]] = {row.id: [] for row in rows}
+            if rows:
+                for document in session.scalars(
+                    select(OpeningDocument)
+                    .where(OpeningDocument.opening_id.in_(documents))
+                    .options(
+                        load_only(
+                            OpeningDocument.id,
+                            OpeningDocument.opening_id,
+                            OpeningDocument.file_name,
+                            OpeningDocument.mime_type,
+                            OpeningDocument.byte_length,
+                            OpeningDocument.created_at,
+                        )
+                    )
+                    .order_by(OpeningDocument.created_at, OpeningDocument.id)
+                ):
+                    documents[document.opening_id].append(document)
             return {
-                "items": [self.read_session(session, id) for id in ids],
+                "items": [self.opening_read(row, documents[row.id]) for row in rows],
                 "limit": limit,
                 "offset": offset,
             }
@@ -221,6 +258,18 @@ class OpeningService:
             "files": [{"hash": f.digest, "mime": f.mime_type, "name": f.name} for f in files],
         }
         with self.tenants.scope(actor, tenant) as session:
+            previous = existing_request(session, tenant, "opening", key, fingerprint)
+            if previous:
+                return self.read_session(session, previous), False
+            prepare_rubric(
+                session,
+                self.providers.rubrics,
+                job_description(
+                    payload.title, payload.job_description, payload.details.model_dump()
+                ),
+                tenant,
+            )
+        with self.tenants.scope(actor, tenant) as session:
             advisory_lock(session, f"tenant:{tenant}")
             previous = existing_request(session, tenant, "opening", key, fingerprint)
             if previous:
@@ -247,6 +296,18 @@ class OpeningService:
     def update(
         self, actor: Principal, tenant: UUID, opening: UUID, payload: OpeningUpdate
     ) -> dict[str, Any]:
+        with self.tenants.scope(actor, tenant) as session:
+            row = self.locked(session, opening, payload.expected_revision)
+            if row.status == "closed":
+                raise AppError("OPENING_CLOSED", "Closed openings cannot be edited.", 409)
+            prepare_rubric(
+                session,
+                self.providers.rubrics,
+                job_description(
+                    payload.title, payload.job_description, payload.details.model_dump()
+                ),
+                tenant,
+            )
         with self.tenants.scope(actor, tenant) as session:
             advisory_lock(session, f"tenant:{tenant}")
             row = self.locked(session, opening, payload.expected_revision)

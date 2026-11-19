@@ -95,6 +95,7 @@ class CandidateRead(Schema):
     opening_id: UUID | None = None
     opening_title: str | None = None
     score: float | None = None
+    no_matching_opening: bool = False
     latest_upload_id: UUID | None = None
 
 

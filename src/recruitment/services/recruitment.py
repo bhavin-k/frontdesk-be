@@ -18,6 +18,7 @@ from recruitment.adapters.db.models import (
 from recruitment.adapters.db.phase2 import IdentityReview
 from recruitment.adapters.documents import validate_file
 from recruitment.adapters.providers import Providers
+from recruitment.core.config import Settings
 from recruitment.core.errors import AppError, ProviderError
 from recruitment.core.time import ist_display, utcnow
 from recruitment.domain.retention import deadline
@@ -33,6 +34,7 @@ from recruitment.services.common import (
 from recruitment.services.evaluation_reads import read_assessment, read_results, saved_decision
 from recruitment.services.intake import store_cv
 from recruitment.services.openings import OpeningService
+from recruitment.services.screening_records import start_screening
 from recruitment.services.tenancy import TenancyService
 
 
@@ -42,9 +44,11 @@ class RecruitmentService:
         tenants: TenancyService,
         providers: Providers,
         storage_factory: Callable[[Session, UUID], FileStorage],
+        settings: Settings,
     ) -> None:
         self.tenants, self.providers = tenants, providers
         self.storage_factory = storage_factory
+        self.settings = settings
 
     @staticmethod
     def _opening(session: Session, opening_id: UUID) -> dict[str, Any]:
@@ -330,6 +334,7 @@ class RecruitmentService:
             emit(session, tenant_id, "review.recorded", app.id)
             if decision == "shortlist":
                 emit(session, tenant_id, "shortlist.ready", app.id)
+                start_screening(session, self.settings, app, principal.user_id)
             remember_request(session, tenant_id, "decision", key, payload, record.id)
             return {
                 "id": record.id,

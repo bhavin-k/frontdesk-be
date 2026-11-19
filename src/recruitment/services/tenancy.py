@@ -26,12 +26,16 @@ class TenancyService:
 
     def memberships(self, principal: Principal) -> list[dict[str, Any]]:
         with self.db.transaction(self.db.auth) as session:
-            return [
-                dict(row)
-                for row in session.execute(
-                    text("SELECT * FROM my_memberships(:actor)"), {"actor": principal.user_id}
-                ).mappings()
-            ]
+            return self.memberships_in_session(session, principal)
+
+    @staticmethod
+    def memberships_in_session(session: Session, principal: Principal) -> list[dict[str, Any]]:
+        return [
+            dict(row)
+            for row in session.execute(
+                text("SELECT * FROM my_memberships(:actor)"), {"actor": principal.user_id}
+            ).mappings()
+        ]
 
     def create(self, principal: Principal, name: str) -> dict[str, Any]:
         with self.db.transaction(self.db.api, user_id=principal.user_id) as session:

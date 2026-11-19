@@ -3,8 +3,8 @@ from uuid import UUID, uuid4
 
 import phonenumbers
 from email_validator import EmailNotValidError, validate_email
-from sqlalchemy import delete, select
-from sqlalchemy.orm import Session
+from sqlalchemy import JSON, String, and_, case, cast, column, delete, func, or_, select, true
+from sqlalchemy.orm import Session, aliased, load_only
 
 from recruitment.adapters.db.matching import MatchingEvaluation, RoleAssessment
 from recruitment.adapters.db.models import (
@@ -36,7 +36,10 @@ from recruitment.services.common import (
     missing,
     remember_request,
 )
+from recruitment.services.evaluation_reads import assessment_read
 from recruitment.services.tenancy import TenancyService
+
+NO_MATCH_SCORE_CUTOFF = 15
 
 
 def contact_values(values: dict[str, Any]) -> dict[str, Any]:
@@ -124,6 +127,32 @@ def correct_contacts(
     )
 
 
+def no_opening_matches(session: Session, best: RoleAssessment) -> bool:
+    if (
+        best.recommendation != "recommended_rejection"
+        or best.score is None
+        or best.score >= NO_MATCH_SCORE_CUTOFF
+    ):
+        return False
+    return (
+        session.scalar(
+            select(RoleAssessment.id)
+            .where(
+                RoleAssessment.evaluation_id == best.evaluation_id,
+                or_(
+                    RoleAssessment.state != "completed",
+                    RoleAssessment.recommendation != "recommended_rejection",
+                    RoleAssessment.provisional.is_(True),
+                    RoleAssessment.score.is_(None),
+                    RoleAssessment.score >= NO_MATCH_SCORE_CUTOFF,
+                ),
+            )
+            .limit(1)
+        )
+        is None
+    )
+
+
 def candidate_read(candidate: Candidate, session: Session | None = None) -> dict[str, Any]:
     result = {
         "id": candidate.id,
@@ -137,6 +166,9 @@ def candidate_read(candidate: Candidate, session: Session | None = None) -> dict
             .where(Application.candidate_id == candidate.id)
             .order_by(Application.created_at.desc(), Application.id.desc())
         )
+        opening_id = app.opening_id if app else None
+        opening_title = None
+        no_matching_opening = False
         run = session.get(MatchRun, app.latest_match_id) if app and app.latest_match_id else None
         score = run.score if app and run and run.resume_id == app.current_resume_id else None
         if app and app.latest_evaluation_id:
@@ -156,17 +188,160 @@ def candidate_read(candidate: Candidate, session: Session | None = None) -> dict
                 )
                 if role is not None:
                     score = role.score
-        opening = session.get(Opening, app.opening_id) if app else None
+                    if app.status != "shortlisted":
+                        no_matching_opening = no_opening_matches(session, role)
+                        opening_id = None if no_matching_opening else role.opening_id
+                        if opening_id is not None:
+                            opening_title = assessment_read(session, role, evaluation)[
+                                "opening_title"
+                            ]
+        if opening_title is None and opening_id is not None:
+            opening = session.get(Opening, opening_id)
+            opening_title = opening.title if opening else None
         resume = (
             session.get(Resume, app.current_resume_id) if app and app.current_resume_id else None
         )
         result.update(
             application_id=app.id if app else None,
             status=app.status if app else "processing",
-            opening_id=app.opening_id if app else None,
-            opening_title=opening.title if opening else None,
+            opening_id=opening_id,
+            opening_title=opening_title,
             score=score,
+            no_matching_opening=no_matching_opening,
             latest_upload_id=resume.upload_id if resume else None,
+        )
+    return result
+
+
+def candidate_page(session: Session, limit: int, offset: int) -> list[dict[str, Any]]:
+    page = (
+        select(Candidate)
+        .order_by(Candidate.created_at.desc(), Candidate.id)
+        .offset(offset)
+        .limit(limit)
+        .subquery()
+    )
+    candidate = aliased(Candidate, page)
+    latest = (
+        select(Application)
+        .where(Application.candidate_id == candidate.id)
+        .order_by(Application.created_at.desc(), Application.id.desc())
+        .limit(1)
+        .correlate(candidate)
+        .lateral()
+    )
+    app = aliased(Application, latest)
+    other = aliased(RoleAssessment)
+    unassessed = (
+        select(other.id)
+        .where(
+            other.evaluation_id == RoleAssessment.evaluation_id,
+            or_(
+                other.state != "completed",
+                other.recommendation != "recommended_rejection",
+                other.provisional.is_(True),
+                other.score.is_(None),
+                other.score >= NO_MATCH_SCORE_CUTOFF,
+            ),
+        )
+        .correlate(RoleAssessment)
+        .exists()
+    )
+    no_match = and_(
+        RoleAssessment.recommendation == "recommended_rejection",
+        RoleAssessment.score < NO_MATCH_SCORE_CUTOFF,
+        ~unassessed,
+    )
+    chosen_opening = case(
+        (
+            and_(RoleAssessment.id.is_not(None), app.status != "shortlisted"),
+            RoleAssessment.opening_id,
+        ),
+        else_=app.opening_id,
+    )
+    snapshot = func.json_array_elements(MatchingEvaluation.role_snapshot).table_valued(
+        column("value", JSON)
+    )
+    snapshot_title = (
+        select(
+            func.coalesce(
+                func.nullif(snapshot.c.value["jd"]["title"].as_string(), ""),
+                snapshot.c.value["title"].as_string(),
+            )
+        )
+        .where(
+            snapshot.c.value["opening_id"].as_string() == cast(RoleAssessment.opening_id, String)
+        )
+        .correlate(MatchingEvaluation, RoleAssessment)
+        .limit(1)
+        .scalar_subquery()
+    )
+    query = (
+        select(candidate, app, snapshot_title, RoleAssessment, MatchRun, Resume, Opening, no_match)
+        .select_from(candidate)
+        .outerjoin(app, true())
+        .outerjoin(
+            MatchingEvaluation,
+            and_(
+                MatchingEvaluation.id == app.latest_evaluation_id,
+                MatchingEvaluation.resume_id == app.current_resume_id,
+                MatchingEvaluation.state == "completed",
+            ),
+        )
+        .outerjoin(
+            RoleAssessment,
+            and_(
+                RoleAssessment.evaluation_id == MatchingEvaluation.id,
+                or_(
+                    and_(app.status == "shortlisted", RoleAssessment.opening_id == app.opening_id),
+                    and_(
+                        app.status != "shortlisted",
+                        RoleAssessment.id == MatchingEvaluation.recommended_assessment_id,
+                    ),
+                ),
+            ),
+        )
+        .outerjoin(
+            MatchRun,
+            and_(MatchRun.id == app.latest_match_id, MatchRun.resume_id == app.current_resume_id),
+        )
+        .outerjoin(Resume, Resume.id == app.current_resume_id)
+        .outerjoin(Opening, Opening.id == chosen_opening)
+        .options(
+            load_only(
+                candidate.id,
+                candidate.profile,
+                candidate.contact_revision,
+                candidate.current_source_at,
+                raiseload=True,
+            ),
+            load_only(app.id, app.status, raiseload=True),
+            load_only(RoleAssessment.score, RoleAssessment.opening_id, raiseload=True),
+            load_only(MatchRun.score, raiseload=True),
+            load_only(Resume.upload_id, raiseload=True),
+            load_only(Opening.title, raiseload=True),
+        )
+        .order_by(candidate.created_at.desc(), candidate.id)
+    )
+    result = []
+    for row, application, frozen_title, role, run, resume, opening, unmatched in session.execute(
+        query
+    ):
+        hidden = bool(unmatched) and application.status != "shortlisted" if application else False
+        title = opening.title if opening else None
+        if role and application.status != "shortlisted":
+            title = frozen_title or title
+        result.append(
+            {
+                **candidate_read(row),
+                "application_id": application.id if application else None,
+                "status": application.status if application else "processing",
+                "opening_id": None if hidden else (opening.id if opening else None),
+                "opening_title": None if hidden else title,
+                "score": role.score if role else (run.score if run else None),
+                "no_matching_opening": hidden,
+                "latest_upload_id": resume.upload_id if resume else None,
+            }
         )
     return result
 
@@ -194,14 +369,8 @@ class CandidateService:
 
     def list(self, actor: Principal, tenant: UUID, limit: int, offset: int) -> dict[str, Any]:
         with self.tenants.scope(actor, tenant) as session:
-            rows = session.scalars(
-                select(Candidate)
-                .order_by(Candidate.created_at.desc(), Candidate.id)
-                .offset(offset)
-                .limit(limit)
-            )
             return {
-                "items": [candidate_read(row, session) for row in rows],
+                "items": candidate_page(session, limit, offset),
                 "limit": limit,
                 "offset": offset,
             }

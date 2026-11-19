@@ -8,6 +8,7 @@ from recruitment.adapters.db import (
     matching,  # noqa: F401 - register evaluation metadata
     openings,  # noqa: F401 - register opening table metadata
     phase2,  # noqa: F401 - register intake table metadata
+    screening,  # noqa: F401 - register screening table metadata
 )
 from recruitment.adapters.db.models import Base
 

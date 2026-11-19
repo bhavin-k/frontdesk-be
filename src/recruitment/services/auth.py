@@ -7,6 +7,7 @@ from uuid import UUID
 from pwdlib import PasswordHash
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from recruitment.adapters.db.better_auth import BetterAuthSession
 from recruitment.adapters.db.models import AuthSession, LoginAttempt, User
@@ -104,24 +105,29 @@ class AuthService:
         if not 32 <= len(token) <= 256:
             raise AppError("UNAUTHENTICATED", "Sign in to continue.", 401)
         with self.db.transaction(self.db.auth) as session:
-            web_session = session.scalar(
-                select(BetterAuthSession).where(
-                    BetterAuthSession.token == token,
-                    BetterAuthSession.expires_at > utcnow(),
-                )
+            return self.authenticate_in_session(session, token)
+
+    def authenticate_in_session(self, session: Session, token: str) -> Principal:
+        if not 32 <= len(token) <= 256:
+            raise AppError("UNAUTHENTICATED", "Sign in to continue.", 401)
+        web_session = session.scalar(
+            select(BetterAuthSession).where(
+                BetterAuthSession.token == token,
+                BetterAuthSession.expires_at > utcnow(),
             )
-            if web_session:
-                return Principal(web_session.user_id, web_session.id)
-            record = session.scalar(
-                select(AuthSession).where(
-                    AuthSession.token_hash == hashlib.sha256(token.encode()).hexdigest(),
-                    AuthSession.revoked_at.is_(None),
-                    AuthSession.expires_at > utcnow(),
-                )
+        )
+        if web_session:
+            return Principal(web_session.user_id, web_session.id)
+        record = session.scalar(
+            select(AuthSession).where(
+                AuthSession.token_hash == hashlib.sha256(token.encode()).hexdigest(),
+                AuthSession.revoked_at.is_(None),
+                AuthSession.expires_at > utcnow(),
             )
-            if not record:
-                raise AppError("UNAUTHENTICATED", "Sign in to continue.", 401)
-            return Principal(record.user_id, record.id)
+        )
+        if not record:
+            raise AppError("UNAUTHENTICATED", "Sign in to continue.", 401)
+        return Principal(record.user_id, record.id)
 
     def logout(self, principal: Principal) -> None:
         with self.db.transaction(self.db.auth) as session:

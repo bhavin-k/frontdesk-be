@@ -1,11 +1,13 @@
 """Evaluate one saved CV profile against the active openings in its tenant."""
 
+from copy import copy
 from decimal import Decimal
 from uuid import UUID, uuid4
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from recruitment.adapters.ai import JDMatcher
 from recruitment.adapters.db.matching import MatchingEvaluation, RoleAssessment
 from recruitment.adapters.db.models import (
     Application,
@@ -20,8 +22,10 @@ from recruitment.core.time import utcnow
 from recruitment.domain.contracts import CandidateProfile, JobDescription
 from recruitment.domain.matching import checked_match, masked_profile
 from recruitment.domain.retention import deadline
+from recruitment.domain.scoring_contracts import POLICY_VERSION
 from recruitment.ports.queue import Lease, WorkerQueue
 from recruitment.services.common import emit
+from recruitment.services.scoring_rubrics import prepare_rubric
 
 
 def has_decision(session: Session, app: Application, resume_id: UUID) -> bool:
@@ -51,12 +55,32 @@ class MatchingWorkflow:
         work = self._begin(lease, resume_id)
         if work is None:
             return
-        evaluation_id, jobs = work
+        evaluation_id, jobs, prompt = work
+        matcher = self.providers.matcher
+        if isinstance(matcher, JDMatcher) and matcher.prompt != prompt:
+            matcher = copy(matcher)
+            matcher.prompt = prompt
         masked = masked_profile(profile)
         exhausted: ProviderError | None = None
         for role_id, job in jobs:
             try:
-                match = checked_match(job, profile, self.providers.matcher.match(job, masked))
+                if prompt == MATCHER_PROMPT and job.rubric is None:
+                    with self.queue.rubric_scope(lease) as session:
+                        job.rubric = prepare_rubric(
+                            session, self.providers.rubrics, job, lease.tenant_id
+                        )
+                    with self.queue.owned(lease) as session:
+                        evaluation = session.get(MatchingEvaluation, evaluation_id)
+                        assert evaluation is not None
+                        role = session.get(RoleAssessment, role_id)
+                        assert role is not None
+                        evaluation.role_snapshot = [
+                            {**row, "jd": job.model_dump()}
+                            if row["opening_id"] == str(role.opening_id)
+                            else row
+                            for row in evaluation.role_snapshot
+                        ]
+                match = checked_match(job, profile, matcher.match(job, masked))
             except ProviderError as exc:
                 if exc.retryable:
                     if lease.attempts < self.queue.settings.max_job_attempts:
@@ -84,7 +108,7 @@ class MatchingWorkflow:
 
     def _begin(
         self, lease: Lease, resume_id: UUID
-    ) -> tuple[UUID, list[tuple[UUID, JobDescription]]] | None:
+    ) -> tuple[UUID, list[tuple[UUID, JobDescription]], str] | None:
         with self.queue.owned(lease) as session:
             upload = session.get(CVUpload, lease.aggregate_id)
             assert upload is not None and upload.application_id
@@ -95,6 +119,8 @@ class MatchingWorkflow:
                 return None
 
             roles = upload.matching_openings
+            if any(row.get("scoring_policy", POLICY_VERSION) != POLICY_VERSION for row in roles):
+                raise ProviderError("PROCESSING_CONFIG_CHANGED")
             config = {
                 "pipeline": "cv-json-v1",
                 "matcher": self.providers.matcher.model,
@@ -102,6 +128,7 @@ class MatchingWorkflow:
                 "endpoint": self.queue.settings.llm_base_url,
                 "format": self.queue.settings.llm_api(),
                 "prompt": MATCHER_PROMPT,
+                "scoring_policy": POLICY_VERSION,
             }
             signature = "cv-json-v1"
             evaluation = session.scalar(
@@ -156,11 +183,21 @@ class MatchingWorkflow:
             if app.current_resume_id == resume_id and app.latest_evaluation_id != evaluation.id:
                 app.latest_evaluation_id, app.latest_match_id = evaluation.id, None
                 app.status, app.lock_version = "processing", app.lock_version + 1
-            if evaluation.config != config:
+            prompt = evaluation.config.get("prompt")
+            comparable = {
+                **evaluation.config,
+                "prompt": config["prompt"],
+                "scoring_policy": POLICY_VERSION,
+            }
+            if (
+                prompt not in {"jd-matcher-v1", "jd-matcher-v2", MATCHER_PROMPT}
+                or evaluation.config.get("scoring_policy", POLICY_VERSION) != POLICY_VERSION
+                or comparable != config
+            ):
                 raise ProviderError("PROCESSING_CONFIG_CHANGED")
             evaluation.state = "processing"
             upload.status = "matching"
-            descriptions = {row["opening_id"]: row["jd"] for row in roles}
+            descriptions = {row["opening_id"]: row["jd"] for row in evaluation.role_snapshot}
             pending = session.scalars(
                 select(RoleAssessment)
                 .where(
@@ -168,10 +205,14 @@ class MatchingWorkflow:
                 )
                 .order_by(RoleAssessment.opening_id)
             )
-            return evaluation.id, [
-                (role.id, JobDescription.model_validate(descriptions[str(role.opening_id)]))
-                for role in pending
-            ]
+            return (
+                evaluation.id,
+                [
+                    (role.id, JobDescription.model_validate(descriptions[str(role.opening_id)]))
+                    for role in pending
+                ],
+                prompt,
+            )
 
     def _publish(self, lease: Lease, evaluation_id: UUID, resume_id: UUID) -> None:
         with self.queue.owned(lease) as session:

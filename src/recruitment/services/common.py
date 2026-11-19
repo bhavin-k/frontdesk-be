@@ -1,5 +1,6 @@
 import hashlib
 import json
+from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -8,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from recruitment.adapters.db.models import IdempotencyRecord, Outbox
 from recruitment.core.errors import AppError
+from recruitment.core.time import utcnow
 
 
 def advisory_lock(session: Session, scope: str) -> None:
@@ -62,6 +64,8 @@ def emit(
     kind: str,
     aggregate_id: UUID,
     dedupe_key: str | None = None,
+    *,
+    available_at: datetime | None = None,
 ) -> None:
     session.add(
         Outbox(
@@ -70,6 +74,7 @@ def emit(
             kind=kind,
             aggregate_id=aggregate_id,
             dedupe_key=dedupe_key or f"{kind}:{aggregate_id}:{uuid4()}",
+            available_at=available_at or utcnow(),
         )
     )
 

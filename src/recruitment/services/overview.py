@@ -25,34 +25,67 @@ class OverviewService:
         self, actor: Principal, tenant: UUID, opening_id: UUID | None, days: int
     ) -> dict[str, Any]:
         with self.tenants.scope(actor, tenant) as session:
-            openings = list(
-                session.scalars(select(Opening).order_by(Opening.created_at, Opening.id))
-            )
-            if opening_id and not any(row.id == opening_id for row in openings):
-                raise missing()
-            counts: dict[UUID, Counter[str]] = {row.id: Counter() for row in openings}
-            for opening, status, attached, count in session.execute(
+            cv_counts = (
                 select(
                     CVUpload.opening_id,
-                    CVUpload.status,
-                    CVUpload.application_id.is_not(None),
-                    func.count(),
-                ).group_by(
-                    CVUpload.opening_id, CVUpload.status, CVUpload.application_id.is_not(None)
+                    func.count().label("received"),
+                    func.count().filter(CVUpload.status == "completed").label("processed"),
+                    func.count()
+                    .filter(CVUpload.status == "needs_review", CVUpload.application_id.is_(None))
+                    .label("review"),
                 )
-            ):
-                counts[opening]["cvs_received"] += count
-                if status == "completed":
-                    counts[opening]["processed"] += count
-                if status == "needs_review" and not attached:
-                    counts[opening]["needs_review"] += count
-            for opening, status, count in session.execute(
-                select(Application.opening_id, Application.status, func.count()).group_by(
-                    Application.opening_id, Application.status
+                .group_by(CVUpload.opening_id)
+                .subquery()
+            )
+            app_counts = (
+                select(
+                    Application.opening_id,
+                    func.count().filter(Application.status == "shortlisted").label("shortlisted"),
+                    func.count().filter(Application.status == "needs_review").label("review"),
+                    func.count().filter(Application.status == "rejected").label("rejected"),
                 )
-            ):
-                if status in {"shortlisted", "needs_review", "rejected"}:
-                    counts[opening][status] += count
+                .group_by(Application.opening_id)
+                .subquery()
+            )
+            rows = list(
+                session.execute(
+                    select(
+                        Opening,
+                        cv_counts.c.received,
+                        cv_counts.c.processed,
+                        cv_counts.c.review,
+                        app_counts.c.shortlisted,
+                        app_counts.c.review,
+                        app_counts.c.rejected,
+                    )
+                    .outerjoin(cv_counts, cv_counts.c.opening_id == Opening.id)
+                    .outerjoin(app_counts, app_counts.c.opening_id == Opening.id)
+                    .order_by(Opening.created_at, Opening.id)
+                )
+            )
+            openings = [row[0] for row in rows]
+            if opening_id and not any(row.id == opening_id for row in openings):
+                raise missing()
+            counts = {
+                opening.id: Counter(
+                    {
+                        "cvs_received": received or 0,
+                        "processed": processed or 0,
+                        "needs_review": (cv_review or 0) + (app_review or 0),
+                        "shortlisted": shortlisted or 0,
+                        "rejected": rejected or 0,
+                    }
+                )
+                for (
+                    opening,
+                    received,
+                    processed,
+                    cv_review,
+                    shortlisted,
+                    app_review,
+                    rejected,
+                ) in rows
+            }
             chosen = [row for row in openings if not opening_id or row.id == opening_id]
             total: Counter[str] = Counter()
             for row in chosen:

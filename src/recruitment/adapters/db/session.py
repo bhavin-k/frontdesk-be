@@ -1,4 +1,5 @@
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from uuid import UUID
 
@@ -23,7 +24,9 @@ class Database:
     def _engine(url: str, role: str) -> Engine:
         from sqlalchemy import event
 
-        engine = create_engine(url, pool_pre_ping=True, hide_parameters=True)
+        engine = create_engine(
+            url, pool_pre_ping=True, hide_parameters=True, connect_args={"connect_timeout": 10}
+        )
 
         @event.listens_for(engine, "connect")
         def verify_role(connection: object, _: object) -> None:
@@ -45,10 +48,10 @@ class Database:
         self, engine: Engine, tenant_id: UUID | None = None, user_id: UUID | None = None
     ) -> Iterator[Session]:
         with Session(engine) as session, session.begin():
-            session.execute(text("SET LOCAL TIME ZONE 'UTC'"))
             session.execute(
                 text(
-                    "SELECT set_config('app.tenant_id', :tenant, true), "
+                    "SELECT set_config('TimeZone', 'UTC', true), "
+                    "set_config('app.tenant_id', :tenant, true), "
                     "set_config('app.user_id', :user, true)"
                 ),
                 {
@@ -61,3 +64,11 @@ class Database:
     def dispose(self) -> None:
         for engine in (self.api, self.auth, self.worker, self.dispatcher):
             engine.dispose()
+
+    def warm(self) -> None:
+        def check(engine: Engine) -> None:
+            with self.transaction(engine) as session:
+                session.execute(text("SELECT 1"))
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(check, (self.api, self.auth)))

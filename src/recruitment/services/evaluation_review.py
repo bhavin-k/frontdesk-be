@@ -13,6 +13,7 @@ from recruitment.adapters.db.models import (
     RetentionSetting,
     ReviewDecision,
 )
+from recruitment.core.config import Settings
 from recruitment.core.errors import AppError
 from recruitment.core.time import utcnow
 from recruitment.domain.retention import deadline
@@ -24,6 +25,7 @@ from recruitment.services.common import (
     missing,
     remember_request,
 )
+from recruitment.services.screening_records import start_screening
 from recruitment.services.tenancy import TenancyService
 
 
@@ -39,6 +41,7 @@ def decide_evaluation(
     confirmed: bool,
     reason: str | None,
     key: str,
+    settings: Settings,
 ) -> tuple[dict[str, Any], bool]:
     if decision == "reject" and not confirmed:
         raise AppError("CONFIRMATION_REQUIRED", "Confirm the rejection before saving it.")
@@ -87,6 +90,27 @@ def decide_evaluation(
         if decision == "shortlist":
             if role is None:
                 raise AppError("ROLE_REQUIRED", "Select one active role before saving.", 422)
+            if app.status == "shortlisted" and app.opening_id == role.opening_id:
+                latest = session.scalar(
+                    select(ReviewDecision)
+                    .where(ReviewDecision.application_id == app.id)
+                    .order_by(ReviewDecision.created_at.desc(), ReviewDecision.id.desc())
+                    .limit(1)
+                )
+                if (
+                    latest
+                    and latest.decision == "shortlist"
+                    and latest.evaluation_id == evaluation.id
+                    and latest.role_assessment_id == role.id
+                    and latest.reason == reason
+                ):
+                    remember_request(session, tenant_id, "decision", key, payload, latest.id)
+                    return {
+                        "id": latest.id,
+                        "decision": latest.decision,
+                        "status": app.status,
+                        "retention_expires_at": app.retention_expires_at,
+                    }, False
             opening = session.get(Opening, role.opening_id)
             if not opening or opening.status != "active":
                 raise AppError("OPENING_NOT_ACTIVE", "Select an active opening.", 409)
@@ -126,6 +150,7 @@ def decide_evaluation(
         emit(session, tenant_id, "review.recorded", app.id, f"review.recorded:{record.id}")
         if decision == "shortlist":
             emit(session, tenant_id, "shortlist.ready", app.id, f"shortlist.ready:{record.id}")
+            start_screening(session, settings, app, principal.user_id)
         remember_request(session, tenant_id, "decision", key, payload, record.id)
         return {
             "id": record.id,

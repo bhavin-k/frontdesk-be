@@ -73,6 +73,22 @@ class GmailIMAPProvider:
             raise ProviderError("IMAP_RESPONSE_INVALID")
         return value.decode("ascii")
 
+    @contextmanager
+    def inbox(
+        self, credentials: dict[str, Any], folder: str = "INBOX"
+    ) -> Iterator[tuple[imaplib.IMAP4_SSL, str]]:
+        with self._session(credentials) as client:
+            yield client, self._select(client, folder)
+
+    @staticmethod
+    def uids_since(client: imaplib.IMAP4_SSL, last: int, after: datetime) -> list[int]:
+        # IMAP's day-only search uses the mailbox date. The caller checks INTERNALDATE.
+        day = (after.astimezone(UTC) - timedelta(days=1)).strftime("%d-%b-%Y")
+        status, rows = client.uid("search", "UID", f"{last + 1}:*", "SINCE", day)
+        if status != "OK" or not rows or not isinstance(rows[0], bytes):
+            raise ProviderError("IMAP_RESPONSE_INVALID")
+        return sorted({int(value) for value in rows[0].split() if int(value) > last})
+
     def login(self, email: str, password: str) -> MailboxGrant:
         value = "".join(password.split())
         if len(value) != 16 or not value.isascii():
@@ -180,17 +196,11 @@ class GmailIMAPProvider:
     def page(
         self, credentials: dict[str, Any], folder: str, cursor: dict[str, Any], after: datetime
     ) -> MessagePage:
-        with self._session(credentials) as client:
-            validity = self._select(client, folder)
+        with self.inbox(credentials, folder) as (client, validity):
             if validity != cursor["uidvalidity"]:
                 raise CursorExpired
             last = int(cursor["last_uid"])
-            # IMAP day-only search ignores time zones. Fetch exact INTERNALDATE before bodies.
-            day = (after.astimezone(UTC) - timedelta(days=1)).strftime("%d-%b-%Y")
-            status, rows = client.uid("search", "UID", f"{last + 1}:*", "SINCE", day)
-            if status != "OK" or not rows or not isinstance(rows[0], bytes):
-                raise ProviderError("IMAP_RESPONSE_INVALID")
-            uids = sorted({int(value) for value in rows[0].split() if int(value) > last})
+            uids = self.uids_since(client, last, after)
             messages = []
             for uid in uids[:PAGE_SIZE]:
                 metadata = self._metadata(client, uid)

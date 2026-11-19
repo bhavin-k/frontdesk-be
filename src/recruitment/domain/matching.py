@@ -5,6 +5,7 @@ from recruitment.core.errors import ProviderError
 from recruitment.domain.contracts import CandidateProfile, JobDescription, MatchResult
 
 _CONTACT_TEXT = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|\+?\d(?:[\d ()-]{8,}\d)", re.IGNORECASE)
+EXPERIENCE_FAILURE_SCORE_CAP = 14
 
 
 def masked_profile(profile: CandidateProfile) -> dict[str, Any]:
@@ -32,6 +33,36 @@ def checked_match(
     job: JobDescription, profile: CandidateProfile, result: MatchResult
 ) -> MatchResult:
     exp_ok = profile.total_experience_years >= job.min_experience_years
-    if result.exp_ok != exp_ok or (result.fit and not exp_ok) or not result.reason.strip():
+    if not result.reason.strip():
         raise ProviderError("INVALID_MATCH_OUTPUT")
-    return result.model_copy(update={"score": round(result.score, 2)})
+    score = round(result.score, 2)
+    reason = result.reason
+    skills = f"Matches {', '.join(result.matched[:3])[:500]}. " if result.matched else ""
+    experience = (
+        f"Required {job.min_experience_years:g} years; "
+        f"CV documents {profile.total_experience_years:g} years."
+    )
+    if not exp_ok:
+        score = min(score, EXPERIENCE_FAILURE_SCORE_CAP)
+        if result.score_breakdown is None:
+            reason = (
+                f"{skills}Experience requirement not met. {experience} "
+                f"The score is capped at {EXPERIENCE_FAILURE_SCORE_CAP} "
+                "because the minimum is unmet."
+            )
+    elif result.exp_ok != exp_ok:
+        gaps = (
+            f" Undocumented requirements include {', '.join(result.missing[:3])[:500]}."
+            if result.missing
+            else ""
+        )
+        reason = f"{skills}Experience minimum met. {experience}{gaps}"
+    return MatchResult.model_validate(
+        {
+            **result.model_dump(),
+            "fit": result.fit and exp_ok,
+            "exp_ok": exp_ok,
+            "score": score,
+            "reason": reason,
+        }
+    )

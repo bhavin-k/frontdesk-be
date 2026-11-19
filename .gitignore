@@ -35,6 +35,22 @@ build/
 dist/
 *.whl
 
+# Local tests and fixtures (excluded from version control by request)
+tests/
+**/__tests__/
+*.test.*
+*.spec.*
+
+# Temporary files and editor backups
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*.swp
+*.swo
+*~
+
 # Editor and OS files
 .idea/
 .vscode/

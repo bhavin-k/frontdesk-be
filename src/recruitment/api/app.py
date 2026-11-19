@@ -1,13 +1,16 @@
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -15,7 +18,16 @@ from recruitment.adapters.db.session import Database
 from recruitment.adapters.file_storage import PostgresFileStorage
 from recruitment.adapters.mail_runtime import MailboxRuntime
 from recruitment.adapters.providers import Providers
-from recruitment.api import auth, intake, mail_webhooks, opening_routes, recruitment, tenants
+from recruitment.api import (
+    auth,
+    dashboard,
+    intake,
+    mail_webhooks,
+    opening_routes,
+    recruitment,
+    screening,
+    tenants,
+)
 from recruitment.api.dependencies import Container
 from recruitment.api.schemas import ErrorResponse
 from recruitment.core.config import Settings
@@ -28,6 +40,7 @@ from recruitment.services.mailboxes import MailboxService
 from recruitment.services.openings import OpeningService
 from recruitment.services.overview import OverviewService
 from recruitment.services.recruitment import RecruitmentService
+from recruitment.services.screening_dashboard import ScreeningDashboard
 from recruitment.services.tenancy import TenancyService
 
 
@@ -90,17 +103,25 @@ def create_app(settings: Settings | None = None, providers: Providers | None = N
         db,
         AuthService(db, settings),
         tenancy,
-        RecruitmentService(tenancy, providers, PostgresFileStorage),
+        RecruitmentService(tenancy, providers, PostgresFileStorage, settings),
         MailboxService(tenancy, providers.mailboxes),
         CandidateService(tenancy),
         MailNotifications(db, providers.mailboxes),
         OverviewService(tenancy),
         OpeningService(tenancy, providers),
+        ScreeningDashboard(tenancy, settings),
     )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         try:
+            started = perf_counter()
+            await run_in_threadpool(db.warm)
+            app.state.database_warmup_seconds = perf_counter() - started
+            logging.getLogger("uvicorn.error").info(
+                "Restricted database connections prepared in %.3fs",
+                app.state.database_warmup_seconds,
+            )
             yield
         finally:
             try:
@@ -115,6 +136,7 @@ def create_app(settings: Settings | None = None, providers: Providers | None = N
         description="CV intake from uploads and new email, evidence matching and recruiter review.",
     )
     app.state.container = services
+    app.state.performance_diagnostics = settings.environment == "development"
     app.add_middleware(RequestLimit)
 
     @app.middleware("http")
@@ -160,7 +182,11 @@ def create_app(settings: Settings | None = None, providers: Providers | None = N
         )
 
     @app.get("/health/live", tags=["Health"])
-    def live() -> dict[str, str]:
+    def live(response: Response) -> dict[str, str]:
+        if settings.environment == "development" and hasattr(app.state, "database_warmup_seconds"):
+            response.headers["Server-Timing"] = (
+                f"startup_db;dur={app.state.database_warmup_seconds * 1000:.1f}"
+            )
         return {"status": "ok"}
 
     @app.get("/health/ready", tags=["Health"])
@@ -170,6 +196,8 @@ def create_app(settings: Settings | None = None, providers: Providers | None = N
                 session.execute(text("SELECT 1"))
         with db.transaction(db.api) as session:
             session.execute(text("SELECT match_result FROM role_assessments LIMIT 0"))
+            session.execute(text("SELECT id FROM screening_requests LIMIT 0"))
+            session.execute(text("SELECT mailbox_connection_id FROM screening_threads LIMIT 0"))
         return {"status": "ok"}
 
     errors: dict[int | str, dict[str, Any]] = {
@@ -178,12 +206,14 @@ def create_app(settings: Settings | None = None, providers: Providers | None = N
     }
     for router in (
         auth.router,
+        dashboard.router,
         tenants.router,
         recruitment.router,
         opening_routes.router,
         intake.router,
         intake.oauth,
         mail_webhooks.router,
+        screening.router,
     ):
         app.include_router(router, responses=errors)
     return app

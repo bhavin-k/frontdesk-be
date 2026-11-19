@@ -138,6 +138,7 @@ def decide(
             payload.confirm_rejection,
             payload.reason,
             key,
+            services.recruitment.settings,
         )
         if not created:
             response.status_code = 200

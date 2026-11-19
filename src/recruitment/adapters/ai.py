@@ -21,7 +21,14 @@ from pydantic import BaseModel, ValidationError
 from recruitment.adapters.ai_requests import TokenUsage, request_with_rate_limit_retries
 from recruitment.core.config import LLMAPIFormat, LLMOutputMode
 from recruitment.core.errors import ProviderError
-from recruitment.domain.contracts import CandidateProfile, JobDescription, MatchResult
+from recruitment.domain.contracts import (
+    BriefMatchResult,
+    CandidateProfile,
+    JobDescription,
+    MatchResult,
+)
+from recruitment.domain.scoring import calculate_match, profile_evidence, resolve_grades
+from recruitment.domain.scoring_contracts import GRADE_PROMPT, ChecklistDraft, EvidenceChoices
 from recruitment.domain.tokenization import token_count
 
 T = TypeVar("T", bound=BaseModel)
@@ -269,7 +276,10 @@ class StructuredAI:
 
 class CVParser(StructuredAI):
     def profile(self, text: str) -> CandidateProfile:
-        return self.bounded_parse(json.dumps({"cv_reference_text": text}), CandidateProfile)
+        return self.bounded_parse(
+            json.dumps({"cv_reference_text": text}, ensure_ascii=False, separators=(",", ":")),
+            CandidateProfile,
+        )
 
 
 class JDMatcher(StructuredAI):
@@ -279,9 +289,43 @@ class JDMatcher(StructuredAI):
             for key, value in profile.items()
             if key not in {"name", "email", "phone"} and value not in ("", [], None)
         }
+        if job.rubric is not None and self.prompt == GRADE_PROMPT:
+            sources = profile_evidence(cv)
+            evidence: dict[str, dict[str, str]] = {}
+            for key, source in sources.items():
+                group = source.path.split("/")[0]
+                text = source.quote
+                if group == "work_history":
+                    text = source.path.rsplit("/", 1)[-1] + ": " + text
+                evidence.setdefault(group, {})[key] = text
+            value = json.dumps(
+                {
+                    "role": job.title,
+                    "required": {
+                        row.id: row.label for row in job.rubric.criteria if row.kind == "required"
+                    },
+                    "preferred": {
+                        row.id: row.label for row in job.rubric.criteria if row.kind == "preferred"
+                    },
+                    "evidence": evidence,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            grades = resolve_grades(self.bounded_parse(value, EvidenceChoices), sources)
+            return calculate_match(job, profile, grades)
         value = json.dumps(
             {"job": job.model_dump(exclude_none=True), "cv": cv},
             ensure_ascii=False,
             separators=(",", ":"),
         )
-        return self.bounded_parse(value, MatchResult)
+        schema = BriefMatchResult if self.prompt == "jd-matcher-v2" else MatchResult
+        return self.bounded_parse(value, schema)
+
+
+class JDChecklist(StructuredAI):
+    def prepare(self, job: JobDescription) -> ChecklistDraft:
+        value = json.dumps(
+            job.model_dump(exclude={"rubric"}), ensure_ascii=False, separators=(",", ":")
+        )
+        return self.bounded_parse(value, ChecklistDraft)
